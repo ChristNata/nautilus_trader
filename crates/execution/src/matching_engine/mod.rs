@@ -15,6 +15,7 @@
 
 //! Order matching engine components for simulating trading venue behavior.
 
+pub mod cash_commitments;
 pub mod config;
 pub mod ids_generator;
 pub mod inflight;
@@ -42,6 +43,7 @@ use nautilus_common::{
 };
 use nautilus_core::{UUID4, UnixNanos, correctness::CorrectnessResult};
 use nautilus_model::{
+    accounts::{Account, AccountAny},
     data::{
         Bar, BarType, InstrumentClose, OrderBookDelta, OrderBookDeltas, OrderBookDepth10,
         QuoteTick, TradeTick,
@@ -74,7 +76,10 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use self::{
-    config::OrderMatchingEngineConfig, ids_generator::IdsGenerator, inflight::InflightOrders,
+    cash_commitments::{CashCommitments, cash_limit_lock},
+    config::OrderMatchingEngineConfig,
+    ids_generator::IdsGenerator,
+    inflight::InflightOrders,
 };
 use crate::{
     matching_core::{MatchAction, OrderMatchingCore, RestingOrder},
@@ -112,6 +117,7 @@ pub struct OrderMatchingEngine {
     fee_model: FeeModelHandle,
     event_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
     inflight_orders: InflightOrders,
+    cash_commitments: CashCommitments,
     target_bid: Option<Price>,
     target_ask: Option<Price>,
     target_last: Option<Price>,
@@ -125,6 +131,7 @@ pub struct OrderMatchingEngine {
     pending_order_updates: RefCell<IndexMap<ClientOrderId, Vec<OrderUpdated>>>,
     pending_fills: IndexMap<TradeId, PendingFill>,
     post_match_order_ids: IndexSet<ClientOrderId>,
+    held_cash_market_orders: IndexSet<ClientOrderId>,
     ids_generator: IdsGenerator,
     last_trade_size: Option<Quantity>,
     trade_consumption: QuantityRaw,
@@ -198,6 +205,7 @@ impl OrderMatchingEngine {
             fee_model,
             event_handler: None,
             inflight_orders: InflightOrders::default(),
+            cash_commitments: CashCommitments::default(),
             book_type,
             oms_type,
             account_type,
@@ -220,6 +228,7 @@ impl OrderMatchingEngine {
             pending_order_updates: RefCell::new(IndexMap::new()),
             pending_fills: IndexMap::new(),
             post_match_order_ids: IndexSet::new(),
+            held_cash_market_orders: IndexSet::new(),
             ids_generator,
             last_trade_size: None,
             trade_consumption: 0,
@@ -265,6 +274,12 @@ impl OrderMatchingEngine {
         self.inflight_orders = orders;
     }
 
+    /// Attaches the venue's shared CASH commitments, so every matching engine on an Account
+    /// reserves the cash the others committed.
+    pub fn set_cash_commitments(&mut self, commitments: CashCommitments) {
+        self.cash_commitments = commitments;
+    }
+
     fn dispatch_order_event(&self, event: OrderEventAny) {
         if let Some(handler) = &self.event_handler {
             handler(event);
@@ -288,6 +303,7 @@ impl OrderMatchingEngine {
         self.pending_order_updates.get_mut().clear();
         self.pending_fills.clear();
         self.post_match_order_ids.clear();
+        self.held_cash_market_orders.clear();
         self.core.reset();
         self.target_bid = None;
         self.target_ask = None;
@@ -329,7 +345,7 @@ impl OrderMatchingEngine {
 
     fn apply_liquidity_consumption(
         &mut self,
-        mut fills: Vec<(Price, Quantity)>,
+        fills: Vec<(Price, Quantity)>,
         order_side: OrderSide,
         leaves_qty: Quantity,
         book_prices: Option<&[Price]>,
@@ -343,6 +359,24 @@ impl OrderMatchingEngine {
             OrderSide::Sell => &mut self.bid_consumption,
         };
 
+        Self::consume_book_liquidity(
+            &self.book,
+            consumption,
+            fills,
+            order_side,
+            leaves_qty,
+            book_prices,
+        )
+    }
+
+    fn consume_book_liquidity(
+        book: &OrderBook,
+        consumption: &mut IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
+        mut fills: Vec<(Price, Quantity)>,
+        order_side: OrderSide,
+        leaves_qty: Quantity,
+        book_prices: Option<&[Price]>,
+    ) -> Vec<(Price, Quantity)> {
         let mut adjusted_len = 0;
         let mut remaining_qty = leaves_qty.raw();
 
@@ -360,9 +394,7 @@ impl OrderMatchingEngine {
                 .unwrap_or(price);
 
             let book_price_raw = book_price.raw();
-            let level_size = self
-                .book
-                .get_quantity_at_level(book_price, order_side, qty.precision);
+            let level_size = book.get_quantity_at_level(book_price, order_side, qty.precision);
 
             let (original_size, consumed) = consumption
                 .entry(book_price_raw)
@@ -1765,6 +1797,7 @@ impl OrderMatchingEngine {
         }
 
         self.iterate(quote.ts_init, AggressorSide::NoAggressor);
+        self.refill_held_cash_market_orders();
     }
 
     /// Processes a bar and simulates market dynamics by creating synthetic ticks.
@@ -2020,6 +2053,7 @@ impl OrderMatchingEngine {
         }
 
         self.iterate(trade_tick.ts_init, AggressorSide::NoAggressor);
+        self.refill_held_cash_market_orders();
         true
     }
 
@@ -2203,6 +2237,7 @@ impl OrderMatchingEngine {
         }
 
         self.iterate(quote.ts_init, AggressorSide::NoAggressor);
+        self.refill_held_cash_market_orders();
         true
     }
 
@@ -2425,6 +2460,8 @@ impl OrderMatchingEngine {
                 AggressorSide::NoAggressor => {}
             }
         }
+
+        self.refill_held_cash_market_orders();
     }
 
     fn update_quote_tick_or_skip(&mut self, quote: &QuoteTick, context: &str) -> bool {
@@ -3262,6 +3299,15 @@ impl OrderMatchingEngine {
     /// Processes an order cancel command.
     pub fn process_cancel(&mut self, command: &CancelOrder, account_id: AccountId) {
         if !self.core.order_exists(command.client_order_id) {
+            // A held CASH MARKET remainder never enters the matching core but keeps working
+            if let Some(order) = self.order_snapshot(command.client_order_id)
+                && self.is_cash_market_buy_profile(&order)
+                && !order.is_closed()
+                && !order.filled_qty().is_zero()
+            {
+                self.cancel_order(&order, None);
+                return;
+            }
             self.generate_order_cancel_rejected(
                 command.trader_id,
                 command.strategy_id,
@@ -3365,6 +3411,7 @@ impl OrderMatchingEngine {
 
         self.remove_queue_position(client_order_id);
         self.cached_filled_qty.swap_remove(&client_order_id);
+        self.held_cash_market_orders.swap_remove(&client_order_id);
     }
 
     fn resync_core_entry(&mut self, client_order_id: ClientOrderId) -> Option<OrderAny> {
@@ -3546,6 +3593,13 @@ impl OrderMatchingEngine {
                 )
                 .into(),
             );
+            return;
+        }
+
+        if self.is_cash_limit_buy_profile(order)
+            && let Err(e) = self.admit_cash_limit_order(order, limit_px)
+        {
+            self.generate_order_rejected(order, format!("CASH_LIMIT: {e}").into());
             return;
         }
 
@@ -4518,6 +4572,35 @@ impl OrderMatchingEngine {
             return;
         }
 
+        // `order_snapshot` overlays matcher fills; only the raw Cache Order shows native
+        // application progress, which must precede another cash funding decision.
+        let applied_filled_qty = self
+            .cache
+            .borrow()
+            .order(&client_order_id)
+            .map_or(order.filled_qty(), |cached| cached.filled_qty());
+        if self.is_cash_market_buy_profile(&order)
+            && self
+                .cached_filled_qty
+                .get(&order.client_order_id())
+                .is_some_and(|filled| filled > &applied_filled_qty)
+        {
+            // A Fill is still pending native application; its Account debit may also be pending.
+            return;
+        }
+        let guards_cash_market = self.guards_cash_market(&order);
+        let cash_available = if guards_cash_market {
+            match self.cash_market_available_funds(&order) {
+                Ok(available) => available,
+                Err(e) => {
+                    self.reject_or_hold_cash_market_batch(&order, &e);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // Convert quote-denominated quantity at fill time for trigger-style market
         // orders that skipped conversion at submission. Idempotent: orders already
         // converted have `is_quote_quantity == false`.
@@ -4557,6 +4640,10 @@ impl OrderMatchingEngine {
             match self.determine_market_fill_model_price_and_volume(&order) {
                 Ok(result) => result,
                 Err(e) => {
+                    if cash_available.is_some() {
+                        self.reject_or_hold_cash_market_batch(&order, &e);
+                        return;
+                    }
                     log::error!(
                         "Cannot fill market order {}: fill model failed: {e}",
                         order.client_order_id()
@@ -4572,14 +4659,20 @@ impl OrderMatchingEngine {
                 order.order_type(),
                 OrderType::Market | OrderType::StopMarket
             ) {
-            protection_price_calculate(
+            match protection_price_calculate(
                 self.instrument.price_increment(),
                 &order,
                 protection_points,
                 self.core.bid,
                 self.core.ask,
-            )
-            .ok()
+            ) {
+                Ok(price) => Some(price),
+                Err(e) if cash_available.is_some() => {
+                    self.reject_or_hold_cash_market_batch(&order, &e);
+                    return;
+                }
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -4597,6 +4690,59 @@ impl OrderMatchingEngine {
                 OrderType::StopMarket | OrderType::TrailingStopMarket | OrderType::MarketIfTouched
             )
             && order.trigger_price().is_some();
+
+        if let Some(available) = cash_available {
+            let mut consumption = self.ask_consumption.clone();
+            if self.config.liquidity_consumption && !from_synthetic && !is_trigger_price_fill {
+                fills = Self::consume_book_liquidity(
+                    &self.book,
+                    &mut consumption,
+                    fills,
+                    OrderSide::Buy,
+                    order.leaves_qty(),
+                    None,
+                );
+            }
+            let plan =
+                match self.plan_cash_market_batch(&order, &fills, protection_price, available) {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        self.reject_or_hold_cash_market_batch(&order, &e);
+                        return;
+                    }
+                };
+            self.ask_consumption = consumption;
+            for (price, quantity, commission) in plan {
+                if let Err(e) = self.fill_order_with_commission(
+                    &order,
+                    price,
+                    quantity,
+                    LiquiditySide::Taker,
+                    None,
+                    position.as_ref(),
+                    Some(commission),
+                ) {
+                    log::error!(
+                        "Cannot dispatch checked cash market batch {}: {e}",
+                        order.client_order_id()
+                    );
+                    return;
+                }
+            }
+            self.purge_cached_filled_qty_if_closed(order.client_order_id());
+            // A remainder the batch left unfilled keeps working on later liquidity
+            if self
+                .cached_filled_qty
+                .get(&order.client_order_id())
+                .is_some_and(|filled| *filled < order.quantity())
+            {
+                self.held_cash_market_orders.insert(order.client_order_id());
+            } else {
+                self.held_cash_market_orders
+                    .swap_remove(&order.client_order_id());
+            }
+            return;
+        }
 
         if !from_synthetic && !is_trigger_price_fill {
             fills = self.apply_liquidity_consumption(
@@ -4621,6 +4767,264 @@ impl OrderMatchingEngine {
         ) {
             log::error!("Cannot fill market order {}: {e}", order.client_order_id());
         }
+    }
+
+    // A held CASH MARKET BUY remainder keeps working like a live order: new market data re-attempts
+    // it, in hold order, under the same funding rules. Its own unapplied fills still block it.
+    fn refill_held_cash_market_orders(&mut self) {
+        if self.held_cash_market_orders.is_empty() || self.market_status != MarketStatus::Open {
+            return;
+        }
+        let held: Vec<ClientOrderId> = self.held_cash_market_orders.iter().copied().collect();
+        for client_order_id in held {
+            let Some(order) = self.order_snapshot(client_order_id) else {
+                self.held_cash_market_orders.swap_remove(&client_order_id);
+                continue;
+            };
+            if order.is_closed() {
+                self.held_cash_market_orders.swap_remove(&client_order_id);
+                continue;
+            }
+            if order.status() == OrderStatus::PartiallyFilled {
+                self.fill_market_order(client_order_id);
+            }
+        }
+    }
+
+    fn is_cash_market_buy_profile(&self, order: &OrderAny) -> bool {
+        self.account_type == AccountType::Cash
+            && self.book_type == BookType::L1_MBP
+            && order.order_type() == OrderType::Market
+            && order.order_side() == OrderSide::Buy
+            && matches!(order.time_in_force(), TimeInForce::Day | TimeInForce::Gtc)
+    }
+
+    fn guards_cash_market(&self, order: &OrderAny) -> bool {
+        self.is_cash_market_buy_profile(order)
+            && match order.status() {
+                OrderStatus::Initialized
+                | OrderStatus::Released
+                | OrderStatus::Submitted
+                | OrderStatus::Accepted => {
+                    order.filled_qty().is_zero()
+                        && self
+                            .cached_filled_qty
+                            .get(&order.client_order_id())
+                            .is_none_or(Quantity::is_zero)
+                }
+                OrderStatus::PartiallyFilled => !order.filled_qty().is_zero(),
+                _ => false,
+            }
+    }
+
+    fn cash_market_available_funds(&self, order: &OrderAny) -> anyhow::Result<Option<Money>> {
+        let account_id = order
+            .account_id()
+            .or_else(|| self.account_ids.get(&order.trader_id()).copied())
+            .ok_or_else(|| anyhow::anyhow!("Missing native Account binding"))?;
+        let cache = self.cache.borrow();
+        let account = cache
+            .account_owned(&account_id)
+            .ok_or_else(|| anyhow::anyhow!("Missing native CASH Account {account_id}"))?;
+        let AccountAny::Cash(account) = account else {
+            anyhow::bail!("Native Account is not CASH");
+        };
+        if account.allow_borrowing {
+            return Ok(None);
+        }
+        if cache
+            .account_for_venue(&self.venue)
+            .is_none_or(|bound| bound.id() != account_id)
+        {
+            anyhow::bail!("Native CASH venue binding differs from order Account");
+        }
+        let currency = self.instrument.quote_currency();
+        if account.base_currency() != Some(currency)
+            || account.balances().len() != 1
+            || !account.calculated_account_state()
+            || self.instrument.is_inverse()
+            || order.is_quote_quantity()
+            || order.is_reduce_only()
+            || order.is_contingency()
+            || order.parent_order_id().is_some()
+            || order.linked_order_ids().is_some()
+        {
+            anyhow::bail!("Unsupported fresh CASH DAY/GTC market funding plan");
+        }
+        let available = account
+            .balance_free(Some(currency))
+            .ok_or_else(|| anyhow::anyhow!("Missing native free {currency} balance"))?;
+        if available.currency != currency || available.is_negative() {
+            anyhow::bail!("Invalid native free balance");
+        }
+        let pending =
+            self.cash_commitments
+                .pending(&cache, &account, currency, order.client_order_id())?;
+        if pending >= available {
+            return Ok(Some(Money::zero(currency)));
+        }
+        Ok(Some(available - pending))
+    }
+
+    fn is_cash_limit_buy_profile(&self, order: &OrderAny) -> bool {
+        self.account_type == AccountType::Cash
+            && self.book_type == BookType::L1_MBP
+            && order.order_type() == OrderType::Limit
+            && order.order_side() == OrderSide::Buy
+            && matches!(order.time_in_force(), TimeInForce::Day | TimeInForce::Gtc)
+    }
+
+    // Admits a CASH LIMIT BUY only if its fee-inclusive lock fits the free balance left after the
+    // venue's other unapplied commitments, then commits that lock. Without a native Account the
+    // Portfolio locks nothing either, so there is no balance to reserve against.
+    fn admit_cash_limit_order(&self, order: &OrderAny, price: Price) -> anyhow::Result<()> {
+        let Some(account_id) = order
+            .account_id()
+            .or_else(|| self.account_ids.get(&order.trader_id()).copied())
+        else {
+            return Ok(());
+        };
+        let cache = self.cache.borrow();
+        let Some(account) = cache.account_owned(&account_id) else {
+            return Ok(());
+        };
+        let AccountAny::Cash(account) = account else {
+            anyhow::bail!("Native Account is not CASH");
+        };
+        if account.allow_borrowing {
+            return Ok(());
+        }
+        let currency = self.instrument.quote_currency();
+        if account.base_currency() != Some(currency)
+            || account.balances().len() != 1
+            || !account.calculated_account_state()
+        {
+            anyhow::bail!("unsupported account");
+        }
+        if cache
+            .account_for_venue(&self.venue)
+            .is_none_or(|bound| bound.id() != account_id)
+            || self.instrument.is_inverse()
+            || order.is_quote_quantity()
+            || order.is_reduce_only()
+        {
+            anyhow::bail!("unsupported order");
+        }
+        let free = account
+            .balance_free(Some(currency))
+            .ok_or_else(|| anyhow::anyhow!("Missing native free {currency} balance"))?;
+        let pending =
+            self.cash_commitments
+                .pending(&cache, &account, currency, order.client_order_id())?;
+        let required = cash_limit_lock(&account, &self.instrument, order.leaves_qty(), price)?;
+        let committed = pending
+            .checked_add(required)
+            .ok_or_else(|| anyhow::anyhow!("Required lock overflow"))?;
+        if committed > free {
+            anyhow::bail!(
+                "Required lock {required} exceeds free balance {free} less pending {pending}"
+            );
+        }
+        drop(cache);
+        self.cash_commitments
+            .record_limit_lock(order, account_id, price);
+        Ok(())
+    }
+
+    fn reject_or_hold_cash_market_batch(&mut self, order: &OrderAny, e: &anyhow::Error) {
+        if !order.filled_qty().is_zero() {
+            log::warn!(
+                "Holding partially filled CASH market order {}: {e}",
+                order.client_order_id()
+            );
+            self.held_cash_market_orders.insert(order.client_order_id());
+            return;
+        }
+        self.purge_stale_core_entry(order.client_order_id());
+        self.generate_order_rejected(order, format!("CASH_BATCH: {e}").into());
+    }
+
+    fn plan_cash_market_batch(
+        &mut self,
+        order: &OrderAny,
+        fills: &[(Price, Quantity)],
+        protection_price: Option<Price>,
+        available: Money,
+    ) -> anyhow::Result<Vec<(Price, Quantity, Money)>> {
+        let mut prices_and_quantities = Vec::with_capacity(fills.len() + 1);
+        let mut total_filled = order.filled_qty();
+        for &(price, quantity) in fills {
+            let mut price = self
+                .normalize_fill_price(price, order.client_order_id())
+                .ok_or_else(|| anyhow::anyhow!("Unsupported fill price"))?;
+            let quantity = self
+                .normalize_fill_quantity(quantity, order.client_order_id())
+                .ok_or_else(|| anyhow::anyhow!("Unsupported fill quantity"))?;
+            if quantity.is_zero() {
+                anyhow::bail!("Zero market fill quantity");
+            }
+            if self.fill_model.is_slipped()? {
+                price = price
+                    .checked_add(self.instrument.price_increment())
+                    .ok_or_else(|| anyhow::anyhow!("Slipped price overflow"))?;
+            }
+            let quantity = min(quantity, order.quantity().saturating_sub(total_filled));
+            if quantity.is_zero() {
+                break;
+            }
+            total_filled = total_filled
+                .checked_add(quantity)
+                .ok_or_else(|| anyhow::anyhow!("Planned fill quantity overflow"))?;
+            prices_and_quantities.push((price, quantity));
+        }
+        if total_filled < order.quantity()
+            && let Some((last_price, _)) = prices_and_quantities.last()
+        {
+            let price = last_price
+                .checked_add(self.instrument.price_increment())
+                .ok_or_else(|| anyhow::anyhow!("L1 remainder price overflow"))?;
+            if protection_price.is_none_or(|boundary| price <= boundary) {
+                prices_and_quantities.push((price, order.quantity().saturating_sub(total_filled)));
+            }
+        }
+        if prices_and_quantities.is_empty() {
+            anyhow::bail!("No market fills");
+        }
+
+        // Each prefix must be fundable: a later rebate cannot finance an earlier debit
+        let mut debit = Money::zero(available.currency);
+        let mut pre_fill_quantity = order.filled_qty();
+        let mut plan = Vec::with_capacity(prices_and_quantities.len());
+        for (price, quantity) in prices_and_quantities {
+            let commission = self.fill_commission(
+                order,
+                price,
+                quantity,
+                pre_fill_quantity,
+                LiquiditySide::Taker,
+            )?;
+            let notional = self
+                .instrument
+                .try_calculate_notional_value(quantity, price, None)?;
+            if notional.currency != available.currency || commission.currency != available.currency
+            {
+                anyhow::bail!("Unsupported notional or commission currency");
+            }
+            debit = debit
+                .checked_add(notional)
+                .and_then(|value| value.checked_add(commission))
+                .ok_or_else(|| anyhow::anyhow!("Native batch debit overflow"))?;
+            if debit > available {
+                anyhow::bail!(
+                    "Complete native batch debit {debit} exceeds free balance {available}"
+                );
+            }
+            pre_fill_quantity = pre_fill_quantity
+                .checked_add(quantity)
+                .ok_or_else(|| anyhow::anyhow!("Fee pre-fill quantity overflow"))?;
+            plan.push((price, quantity, commission));
+        }
+        Ok(plan)
     }
 
     fn filter_fills_by_protection(
@@ -5252,6 +5656,58 @@ impl OrderMatchingEngine {
         });
     }
 
+    fn fill_commission(
+        &self,
+        order: &OrderAny,
+        last_px: Price,
+        last_qty: Quantity,
+        pre_fill_quantity: Quantity,
+        liquidity_side: LiquiditySide,
+    ) -> anyhow::Result<Money> {
+        // The source clone is stale; FixedFee needs the actual pre-fill quantity
+        let mut fee_order = order.clone();
+        write_filled_qty(&mut fee_order, pre_fill_quantity);
+        if order.liquidity_side() != Some(liquidity_side) {
+            fee_order.set_liquidity_side(liquidity_side);
+        }
+        self.fee_model.get_commission_with_context(
+            &fee_order,
+            last_qty,
+            last_px,
+            &self.instrument,
+            self.fee_underlying_price()?,
+        )
+    }
+
+    // Returns the Account and debit (notional plus commission) of a CASH BUY fill.
+    fn cash_buy_fill_debit(
+        &self,
+        order: &OrderAny,
+        last_px: Price,
+        last_qty: Quantity,
+        commission: Money,
+    ) -> anyhow::Result<Option<(AccountId, Money)>> {
+        if self.account_type != AccountType::Cash || order.order_side() != OrderSide::Buy {
+            return Ok(None);
+        }
+        let Some(account_id) = order
+            .account_id()
+            .or_else(|| self.account_ids.get(&order.trader_id()).copied())
+        else {
+            return Ok(None);
+        };
+        let notional = self
+            .instrument
+            .try_calculate_notional_value(last_qty, last_px, None)?;
+        if commission.currency != notional.currency {
+            return Ok(Some((account_id, notional)));
+        }
+        let debit = notional
+            .checked_add(commission)
+            .ok_or_else(|| anyhow::anyhow!("Fill debit overflow"))?;
+        Ok(Some((account_id, debit)))
+    }
+
     fn fill_order(
         &mut self,
         order: &OrderAny,
@@ -5260,6 +5716,28 @@ impl OrderMatchingEngine {
         liquidity_side: LiquiditySide,
         venue_position_id: Option<PositionId>,
         position: Option<&Position>,
+    ) -> anyhow::Result<()> {
+        self.fill_order_with_commission(
+            order,
+            last_px,
+            last_qty,
+            liquidity_side,
+            venue_position_id,
+            position,
+            None,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn fill_order_with_commission(
+        &mut self,
+        order: &OrderAny,
+        last_px: Price,
+        last_qty: Quantity,
+        liquidity_side: LiquiditySide,
+        venue_position_id: Option<PositionId>,
+        position: Option<&Position>,
+        checked_commission: Option<Money>,
     ) -> anyhow::Result<()> {
         self.check_size_precision(last_qty.precision, "fill quantity")?;
 
@@ -5277,35 +5755,30 @@ impl OrderMatchingEngine {
             return Ok(());
         }
 
-        let fee_order;
-        let commission_order = {
-            // `order` is a stale pre-fill clone: give fee models the current
-            // pre-fill `filled_qty` (e.g. `FixedFeeModel` charges once per order).
-            let mut cloned = order.clone();
-            write_filled_qty(&mut cloned, new_filled_qty.saturating_sub(last_qty));
-            if order.liquidity_side() != Some(liquidity_side) {
-                cloned.set_liquidity_side(liquidity_side);
-            }
-            fee_order = cloned;
-            &fee_order
+        let commission = match checked_commission {
+            Some(commission) => commission,
+            None => self.fill_commission(
+                order,
+                last_px,
+                last_qty,
+                new_filled_qty.saturating_sub(last_qty),
+                liquidity_side,
+            )?,
         };
-
-        let underlying_px = self.fee_underlying_price()?;
-        let commission = self.fee_model.get_commission_with_context(
-            commission_order,
-            last_qty,
-            last_px,
-            &self.instrument,
-            underlying_px,
-        )?;
 
         // Resolve implicit membership before dispatch can close the cached position
         let reduce_only_order_ids = position
             .map(|position| self.reduce_only_order_ids(position.id))
             .unwrap_or_default();
 
+        let cash_debit = self.cash_buy_fill_debit(order, last_px, last_qty, commission)?;
+
         self.cached_filled_qty
             .insert(order.client_order_id(), new_filled_qty);
+        if let Some((account_id, debit)) = cash_debit {
+            self.cash_commitments
+                .record_fill(order, account_id, new_filled_qty, debit);
+        }
 
         let venue_order_id = self.ids_generator.get_venue_order_id(order).unwrap();
         self.generate_order_filled(
@@ -6101,6 +6574,8 @@ impl OrderMatchingEngine {
 
         self.remove_queue_position(order.client_order_id());
         self.cached_filled_qty.swap_remove(&order.client_order_id());
+        self.held_cash_market_orders
+            .swap_remove(&order.client_order_id());
 
         let venue_order_id = self.ids_generator.get_venue_order_id(order).unwrap();
         self.generate_order_canceled(order, venue_order_id);

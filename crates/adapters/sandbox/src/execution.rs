@@ -43,7 +43,9 @@ use nautilus_common::{
 use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, WeakCell};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
-    matching_engine::{OrderMatchingEngine, inflight::InflightOrders},
+    matching_engine::{
+        OrderMatchingEngine, cash_commitments::CashCommitments, inflight::InflightOrders,
+    },
     models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
 };
 use nautilus_model::{
@@ -145,6 +147,7 @@ impl SandboxExecutionClient {
                 event_handler: None,
                 inbound_queue: BinaryHeap::new(),
                 inflight_orders: InflightOrders::default(),
+                cash_commitments: CashCommitments::default(),
                 inbound_seq: 0,
                 client_id: core.client_id,
                 account_id: core.account_id,
@@ -879,6 +882,8 @@ struct SandboxInner {
     /// Inbound commands deferred by latency, ordered as a min-heap by due time.
     inbound_queue: BinaryHeap<DelayedCommand>,
     inflight_orders: InflightOrders,
+    /// CASH committed by this client's matching engines but not yet applied to its Account.
+    cash_commitments: CashCommitments,
     /// Monotonic sequence providing FIFO tie-breaking for deferred commands sharing a due time, so
     /// no queued command can be overtaken by one enqueued after it.
     inbound_seq: u64,
@@ -953,6 +958,7 @@ impl SandboxInner {
             }
 
             engine.set_inflight_orders(self.inflight_orders.clone());
+            engine.set_cash_commitments(self.cash_commitments.clone());
             self.matching_engines.insert(instrument_id, engine);
         }
     }
@@ -1690,6 +1696,7 @@ impl SandboxInner {
     fn clear_inbound_queue(&mut self) {
         self.inbound_queue.clear();
         self.inflight_orders.clear();
+        self.cash_commitments.clear();
     }
 
     /// (Re)arms the `LiveClock` alert for the earliest queued `due_ns` while that is still ahead

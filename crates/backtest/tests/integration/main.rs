@@ -20,6 +20,8 @@ mod backtest_node_itch;
 mod backtest_node_workload;
 mod book_imbalance;
 mod canonical_backtest_workloads;
+mod cash_account_reservation;
+mod cash_market_continuation;
 mod ema_cross;
 mod exchange;
 mod grid_mm;

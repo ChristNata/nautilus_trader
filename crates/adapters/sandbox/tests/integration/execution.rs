@@ -56,7 +56,7 @@ use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
     enums::{
-        AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType,
+        AccountType, AggressorSide, BookType, ContingencyType, CurrencyType, InstrumentCloseType,
         MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
     },
     events::{
@@ -69,7 +69,7 @@ use nautilus_model::{
     },
     instruments::{
         CryptoPerpetual, Instrument, InstrumentAny,
-        stubs::{binary_option, crypto_perpetual_ethusdt},
+        stubs::{binary_option, crypto_perpetual_ethusdt, equity_aapl},
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
@@ -848,6 +848,376 @@ fn setup_account_state_handler(cache: Rc<RefCell<Cache>>) {
         MessagingSwitchboard::portfolio_update_account(),
         handler,
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cash_market_rejects_complete_unfunded_batch(
+    trader_id: TraderId,
+    #[values(TimeInForce::Day, TimeInForce::Gtc)] time_in_force: TimeInForce,
+    #[values(false, true)] use_market_order_acks: bool,
+    #[values(false, true)] liquidity_consumption: bool,
+) {
+    Currency::register(
+        Currency::new("IDR", 2, 360, "Indonesian rupiah", CurrencyType::Fiat),
+        false,
+    )
+    .unwrap();
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let mut equity = equity_aapl();
+    equity.id = InstrumentId::from("BBRI.XIDX");
+    equity.currency = Currency::from("IDR");
+    equity.price_precision = 0;
+    equity.price_increment = Price::from("1");
+    equity.lot_size = Some(Quantity::from("100"));
+    equity.maker_fee = Decimal::ZERO;
+    equity.taker_fee = Decimal::ZERO;
+    let instrument = InstrumentAny::Equity(equity);
+    let account_id = AccountId::from("XIDX-001");
+    let mut context =
+        create_test_context_with(trader_id, account_id, instrument.id().venue, |config| {
+            config.account_type = AccountType::Cash;
+            config.base_currency = Some(Currency::from("IDR"));
+            config.starting_balances = vec![Money::from("1000000 IDR")];
+            config.use_market_order_acks = use_market_order_acks;
+            config.liquidity_consumption = liquidity_consumption;
+        });
+    context
+        .cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    setup_account_state_handler(context.cache.clone());
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        context.test_clock.clone(),
+        context.cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    context.client.start().unwrap();
+    context.client.connect().await.unwrap();
+    let before = context
+        .cache
+        .borrow()
+        .account_owned(&account_id)
+        .expect("genuine native CASH Account");
+    let AccountAny::Cash(before_cash) = &before else {
+        panic!("CASH Account required")
+    };
+    assert!(!before_cash.allow_borrowing);
+    assert_eq!(
+        before_cash.base.balances[&Currency::from("IDR")].total,
+        Money::from("1000000 IDR")
+    );
+    context
+        .client
+        .process_quote_tick(&QuoteTick::new(
+            instrument.id(),
+            Price::from("5000"),
+            Price::from("5000"),
+            Quantity::from("100"),
+            Quantity::from("100"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ))
+        .unwrap();
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200"))
+        .time_in_force(time_in_force)
+        .client_order_id(ClientOrderId::from("SANDBOX-CASH-BATCH-1"))
+        .build();
+    context
+        .cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(context.client.client_id()), false)
+        .unwrap();
+    context
+        .client
+        .submit_order(SubmitOrder::from_order(
+            &order,
+            trader_id,
+            Some(context.client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        ))
+        .unwrap();
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Order(event) = event {
+            assert!(
+                !matches!(event, OrderEventAny::Filled(_)),
+                "unfunded complete batch emitted Fill: {event:?}"
+            );
+            engine.borrow_mut().process(&event);
+            events.push(event);
+        }
+    }
+    assert!(matches!(events.first(), Some(OrderEventAny::Submitted(_))));
+    assert!(matches!(events.last(), Some(OrderEventAny::Rejected(_))));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, OrderEventAny::Accepted(_)))
+            .count(),
+        usize::from(use_market_order_acks)
+    );
+    let cache = context.cache.borrow();
+    let cached_order = cache.order(&order.client_order_id()).unwrap();
+    assert_eq!(cached_order.status(), OrderStatus::Rejected);
+    assert_eq!(cached_order.quantity(), Quantity::from("200"));
+    assert_eq!(cached_order.time_in_force(), time_in_force);
+    assert_eq!(cached_order.filled_qty(), Quantity::from("0"));
+    assert!(cache.positions(None, None, None, None, None).is_empty());
+    let after = cache.account_owned(&account_id).unwrap();
+    assert_eq!(after.events().len(), before.events().len());
+    let AccountAny::Cash(after_cash) = after else {
+        panic!("CASH Account required")
+    };
+    assert_eq!(after_cash.base.balances, before_cash.base.balances);
+}
+
+// Paper wiring over BBRI (ask 5000) and BBCA (ask 3000) on one CASH Account; order events wait in
+// the execution channel until `drain` applies them, as for concurrent Strategies on Paper.
+struct CashSandbox {
+    context: TestContext,
+    engine: Rc<RefCell<ExecutionEngine>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    instrument_ids: Vec<InstrumentId>,
+    trader_id: TraderId,
+}
+
+impl CashSandbox {
+    async fn new(trader_id: TraderId, seed: &str) -> Self {
+        Currency::register(
+            Currency::new("IDR", 2, 360, "Indonesian rupiah", CurrencyType::Fiat),
+            false,
+        )
+        .unwrap();
+        *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+        let mut instruments = Vec::new();
+        for symbol in ["BBRI", "BBCA"] {
+            let mut equity = equity_aapl();
+            equity.id = InstrumentId::from(format!("{symbol}.XIDX").as_str());
+            equity.currency = Currency::from("IDR");
+            equity.price_precision = 0;
+            equity.price_increment = Price::from("1");
+            equity.lot_size = Some(Quantity::from("100"));
+            equity.maker_fee = Decimal::ZERO;
+            equity.taker_fee = Decimal::ZERO;
+            instruments.push(InstrumentAny::Equity(equity));
+        }
+        let account_id = AccountId::from("XIDX-001");
+        let mut context =
+            create_test_context_with(trader_id, account_id, instruments[0].id().venue, |config| {
+                config.account_type = AccountType::Cash;
+                config.base_currency = Some(Currency::from("IDR"));
+                config.starting_balances = vec![Money::from(format!("{seed} IDR").as_str())];
+            });
+        for instrument in &instruments {
+            context
+                .cache
+                .borrow_mut()
+                .add_instrument(instrument.clone())
+                .unwrap();
+        }
+        setup_account_state_handler(context.cache.clone());
+        let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+            context.test_clock.clone(),
+            context.cache.clone(),
+            None,
+        )));
+        ExecutionEngine::register_msgbus_handlers(&engine);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        set_exec_event_sender(tx);
+        context.client.start().unwrap();
+        context.client.connect().await.unwrap();
+        for (instrument, (bid, ask)) in instruments.iter().zip([("4900", "5000"), ("2900", "3000")])
+        {
+            context
+                .client
+                .process_quote_tick(&QuoteTick::new(
+                    instrument.id(),
+                    Price::from(bid),
+                    Price::from(ask),
+                    Quantity::from("1000"),
+                    Quantity::from("1000"),
+                    UnixNanos::default(),
+                    UnixNanos::default(),
+                ))
+                .unwrap();
+        }
+        let instrument_ids = instruments.iter().map(Instrument::id).collect();
+        Self {
+            context,
+            engine,
+            rx,
+            instrument_ids,
+            trader_id,
+        }
+    }
+
+    fn submit_buy(
+        &self,
+        id: &str,
+        strategy_id: &str,
+        instrument: usize,
+        limit_price: Option<&str>,
+        time_in_force: TimeInForce,
+    ) -> ClientOrderId {
+        let mut builder = OrderTestBuilder::new(OrderType::Market);
+        builder
+            .trader_id(self.trader_id)
+            .strategy_id(StrategyId::from(strategy_id))
+            .instrument_id(self.instrument_ids[instrument])
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100"))
+            .time_in_force(time_in_force)
+            .client_order_id(ClientOrderId::from(id));
+        if let Some(price) = limit_price {
+            builder.kind(OrderType::Limit).price(Price::from(price));
+        }
+        let order = builder.build();
+        let client_id = self.context.client.client_id();
+        self.context
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(client_id), false)
+            .unwrap();
+        self.context
+            .client
+            .submit_order(SubmitOrder::from_order(
+                &order,
+                self.trader_id,
+                Some(client_id),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+            ))
+            .unwrap();
+        order.client_order_id()
+    }
+
+    fn drain(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            if let ExecutionEvent::Order(event) = event {
+                self.engine.borrow_mut().process(&event);
+            }
+        }
+    }
+
+    fn status(&self, client_order_id: &ClientOrderId) -> OrderStatus {
+        self.context
+            .cache
+            .borrow()
+            .order(client_order_id)
+            .unwrap()
+            .status()
+    }
+
+    fn fills(&self, client_order_id: &ClientOrderId) -> Vec<(Quantity, Price)> {
+        let mut fills = Vec::new();
+        let cache = self.context.cache.borrow();
+        for event in cache.order(client_order_id).unwrap().events() {
+            if let OrderEventAny::Filled(fill) = event {
+                fills.push((fill.last_qty, fill.last_px));
+            }
+        }
+        fills
+    }
+
+    fn assert_rejected_with(&self, client_order_id: &ClientOrderId, reason_prefix: &str) {
+        assert_eq!(self.status(client_order_id), OrderStatus::Rejected);
+        assert!(self.fills(client_order_id).is_empty());
+        let mut reasons = Vec::new();
+        let cache = self.context.cache.borrow();
+        for event in cache.order(client_order_id).unwrap().events() {
+            if let OrderEventAny::Rejected(rejected) = event {
+                reasons.push(rejected.reason.to_string());
+            }
+        }
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].starts_with(reason_prefix), "{reasons:?}");
+    }
+
+    fn position_count(&self) -> usize {
+        self.context
+            .cache
+            .borrow()
+            .positions(None, None, None, None, None)
+            .len()
+    }
+}
+
+// Paper wiring: the client's matching engines share CASH commitments, so a MARKET BUY on a second
+// instrument sees the first one's Fill while its events still wait in the execution channel.
+#[rstest]
+#[case::second_funded("800000", true)]
+#[case::second_unfunded("750000", false)]
+#[tokio::test]
+async fn test_cash_concurrent_market_orders_reserve_across_instruments(
+    trader_id: TraderId,
+    #[case] seed: &str,
+    #[case] second_funded: bool,
+    #[values(TimeInForce::Day, TimeInForce::Gtc)] time_in_force: TimeInForce,
+) {
+    let mut sandbox = CashSandbox::new(trader_id, seed).await;
+    let first = sandbox.submit_buy("SANDBOX-CASH-A", "S-A", 0, None, time_in_force);
+    let second = sandbox.submit_buy("SANDBOX-CASH-B", "S-B", 1, None, time_in_force);
+    sandbox.drain();
+
+    assert_eq!(sandbox.status(&first), OrderStatus::Filled);
+    assert_eq!(
+        sandbox.fills(&first),
+        [(Quantity::from("100"), Price::from("5000"))]
+    );
+    if second_funded {
+        assert_eq!(sandbox.status(&second), OrderStatus::Filled);
+        assert_eq!(
+            sandbox.fills(&second),
+            [(Quantity::from("100"), Price::from("3000"))]
+        );
+    } else {
+        sandbox.assert_rejected_with(&second, "CASH_BATCH: Complete native batch debit");
+    }
+    assert_eq!(sandbox.position_count(), 1 + usize::from(second_funded));
+}
+
+// Paper wiring: a LIMIT BUY on a second instrument is admitted only if its lock fits the free
+// balance left after the first instrument's unapplied MARKET Fill.
+#[rstest]
+#[case::limit_funded("800000", true)]
+#[case::limit_unfunded("750000", false)]
+#[tokio::test]
+async fn test_cash_concurrent_limit_reserves_after_market_across_instruments(
+    trader_id: TraderId,
+    #[case] seed: &str,
+    #[case] limit_funded: bool,
+    #[values(TimeInForce::Day, TimeInForce::Gtc)] time_in_force: TimeInForce,
+) {
+    let mut sandbox = CashSandbox::new(trader_id, seed).await;
+    let first = sandbox.submit_buy("SANDBOX-CASH-A", "S-A", 0, None, time_in_force);
+    // A resting LIMIT 100 at 2900 locks 290000.
+    let second = sandbox.submit_buy("SANDBOX-CASH-L", "S-B", 1, Some("2900"), time_in_force);
+    sandbox.drain();
+
+    assert_eq!(sandbox.status(&first), OrderStatus::Filled);
+    assert_eq!(
+        sandbox.fills(&first),
+        [(Quantity::from("100"), Price::from("5000"))]
+    );
+    if limit_funded {
+        assert_eq!(sandbox.status(&second), OrderStatus::Accepted);
+        assert!(sandbox.fills(&second).is_empty());
+    } else {
+        sandbox.assert_rejected_with(&second, "CASH_LIMIT:");
+    }
+    assert_eq!(sandbox.position_count(), 1);
 }
 
 /// Short name for an order event, for assertion messages.

@@ -13,7 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    rc::Rc,
+};
 
 use jiff::{Timestamp, civil::Date, tz::Offset};
 use nautilus_common::{
@@ -29,11 +33,12 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_execution::{
     matching_engine::{OrderMatchingEngine, config::OrderMatchingEngineConfig},
     models::{
-        fee::{CappedOptionFeeModel, FeeModelAny, FixedFeeModel},
+        fee::{CappedOptionFeeModel, FeeModel, FeeModelAny, FeeModelHandle, FixedFeeModel},
         fill::{BestPriceFillModel, DefaultFillModel, FillModel, FillModelAny, FillModelHandle},
     },
 };
 use nautilus_model::{
+    accounts::{AccountAny, CashAccount, MarginAccount},
     data::{
         Bar, BarType, BookOrder, DEPTH10_LEN, IndexPriceUpdate, InstrumentClose, OptionGreeks,
         OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
@@ -41,17 +46,21 @@ use nautilus_model::{
     },
     enums::{
         AccountType, AggressorSide, AssetClass, BookAction, BookType, ContingencyType,
-        InstrumentCloseType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind,
-        OrderSide, OrderStatus, OrderType, RecordFlag, TimeInForce, TrailingOffsetType,
-        TriggerType,
+        CurrencyType, InstrumentCloseType, LiquiditySide, MarketStatus, MarketStatusAction,
+        OmsType, OptionKind, OrderSide, OrderStatus, OrderType, RecordFlag, TimeInForce,
+        TrailingOffsetType, TriggerType,
     },
     events::{
-        OrderEmulated, OrderEventAny, OrderEventType, OrderFilled, OrderRejected, OrderReleased,
-        order::spec::{OrderEmulatedSpec, OrderFilledSpec, OrderRejectedSpec, OrderReleasedSpec},
+        AccountState, OrderEmulated, OrderEventAny, OrderEventType, OrderFilled, OrderRejected,
+        OrderReleased,
+        order::spec::{
+            OrderEmulatedSpec, OrderFilledSpec, OrderRejectedSpec, OrderReleasedSpec,
+            OrderSubmittedSpec,
+        },
     },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, Symbol, TradeId,
-        TraderId, VenueOrderId, stubs::account_id,
+        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
+        Symbol, TradeId, TraderId, VenueOrderId, stubs::account_id,
     },
     instruments::{
         CryptoOption, CryptoPerpetual, Equity, IndexInstrument, Instrument, InstrumentAny,
@@ -65,7 +74,7 @@ use nautilus_model::{
     },
     position::Position,
     stubs::TestDefault,
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rstest::{fixture, rstest};
 use rust_decimal_macros::dec;
@@ -354,6 +363,653 @@ fn clear_order_event_handler_messages(
     event_handler: &TypedIntoMessageSavingHandler<OrderEventAny>,
 ) {
     event_handler.clear();
+}
+
+struct CashMarketTestContext {
+    engine: OrderMatchingEngine,
+    instrument: InstrumentAny,
+    cache: Rc<RefCell<Cache>>,
+    events: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+}
+
+fn cash_market_test_context(
+    seed: &str,
+    native_funding: bool,
+    config: OrderMatchingEngineConfig,
+    fee_model: FeeModelHandle,
+    fill_model: FillModelHandle,
+    account_type: AccountType,
+    allow_borrowing: bool,
+) -> CashMarketTestContext {
+    Currency::register(
+        Currency::new("IDR", 2, 360, "Indonesian rupiah", CurrencyType::Fiat),
+        false,
+    )
+    .unwrap();
+    let mut equity = equity_aapl();
+    equity.id = InstrumentId::from("BBRI.XIDX");
+    equity.raw_symbol = Symbol::from("BBRI");
+    equity.currency = Currency::from("IDR");
+    equity.price_precision = 0;
+    equity.price_increment = Price::from("1");
+    equity.lot_size = Some(Quantity::from("100"));
+    equity.maker_fee = dec!(0);
+    equity.taker_fee = dec!(0);
+    let instrument = InstrumentAny::Equity(equity);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let account_id = AccountId::from("XIDX-001");
+    let seed = Money::from(seed);
+    let state = AccountState::new(
+        account_id,
+        account_type,
+        vec![AccountBalance::new(seed, Money::zero(seed.currency), seed)],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(seed.currency),
+    );
+    if native_funding {
+        cache
+            .borrow_mut()
+            .add_account(if account_type == AccountType::Margin {
+                AccountAny::Margin(MarginAccount::new(state, true))
+            } else {
+                AccountAny::Cash(CashAccount::new(state, true, allow_borrowing))
+            })
+            .unwrap();
+    }
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let events = order_event_handler_with_cache(cache.clone());
+    let mut engine = OrderMatchingEngine::new(
+        instrument.clone(),
+        1,
+        fill_model,
+        fee_model,
+        BookType::L1_MBP,
+        OmsType::Netting,
+        account_type,
+        Rc::new(RefCell::new(TestClock::new())),
+        cache.clone(),
+        config,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("5000"),
+        Price::from("5000"),
+        Quantity::from("100"),
+        Quantity::from("100"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    CashMarketTestContext {
+        engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    }
+}
+
+fn submit_cash_test_order(order: &mut OrderAny, account_id: AccountId) {
+    order
+        .apply(OrderEventAny::Submitted(
+            OrderSubmittedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .account_id(account_id)
+                .build(),
+        ))
+        .unwrap();
+}
+
+// Positive price-model fixtures need a genuine, correctly bound native CASH Account
+fn funded_l1_cash_test_engine(
+    instrument: InstrumentAny,
+    config: OrderMatchingEngineConfig,
+    fill_model: FillModelHandle,
+) -> (OrderMatchingEngine, AccountId) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let account_id = AccountId::new(format!("{}-001", instrument.id().venue));
+    let currency = instrument.quote_currency();
+    let seed = Money::from(format!("1000000 {currency}").as_str());
+    let state = AccountState::new(
+        account_id,
+        AccountType::Cash,
+        vec![AccountBalance::new(seed, Money::zero(currency), seed)],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(currency),
+    );
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::Cash(CashAccount::new(state, true, false)))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let engine = OrderMatchingEngine::new(
+        instrument,
+        1,
+        fill_model,
+        FeeModelHandle::default(),
+        BookType::L1_MBP,
+        OmsType::Netting,
+        AccountType::Cash,
+        Rc::new(RefCell::new(TestClock::new())),
+        cache,
+        config,
+    );
+    (engine, account_id)
+}
+
+// The complete DAY/GTC batch includes the exhausted-L1 remainder at one adverse tick
+#[rstest]
+#[case::unfunded("1000000 IDR", "0 IDR", false, true)]
+#[case::short_by_currency_unit("1000099.99 IDR", "0 IDR", false, true)]
+#[case::exactly_funded("1000100 IDR", "0 IDR", true, true)]
+#[case::funded_original_economics("2000000 IDR", "0 IDR", true, true)]
+#[case::fee_unfunded("1000100 IDR", "1 IDR", false, true)]
+#[case::fee_exactly_funded("1000101 IDR", "1 IDR", true, true)]
+#[case::missing_account("1000100 IDR", "0 IDR", false, false)]
+#[case::unsupported_currency("1000100 USD", "0 IDR", false, true)]
+fn test_cash_market_complete_batch_funding(
+    #[case] seed: &str,
+    #[case] commission: &str,
+    #[case] funded: bool,
+    #[case] native_funding: bool,
+    #[values(TimeInForce::Day, TimeInForce::Gtc)] time_in_force: TimeInForce,
+    #[values(false, true)] use_market_order_acks: bool,
+    #[values(false, true)] liquidity_consumption: bool,
+) {
+    Currency::register(
+        Currency::new("IDR", 2, 360, "Indonesian rupiah", CurrencyType::Fiat),
+        false,
+    )
+    .unwrap();
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        seed,
+        native_funding,
+        OrderMatchingEngineConfig {
+            use_market_order_acks,
+            liquidity_consumption,
+            ..Default::default()
+        },
+        FeeModelAny::Fixed(FixedFeeModel::new(Money::from(commission), Some(true)).unwrap()).into(),
+        FillModelHandle::default(),
+        AccountType::Cash,
+        false,
+    );
+    let seed = Money::from(seed);
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200"))
+        .time_in_force(time_in_force)
+        .client_order_id(ClientOrderId::from("CASH-BATCH-1"))
+        .build();
+    submit_cash_test_order(&mut order, account_id);
+    assert_eq!(order.account_id(), Some(account_id));
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+    let messages = events.get_messages();
+    let fills: Vec<_> = messages
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .collect();
+    let cached = cache
+        .borrow()
+        .order(&order.client_order_id())
+        .unwrap()
+        .clone();
+    assert_eq!(cached.quantity(), Quantity::from("200"));
+    assert_eq!(cached.time_in_force(), time_in_force);
+    if funded {
+        assert_eq!(cached.status(), OrderStatus::Filled);
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].last_qty, Quantity::from("100"));
+        assert_eq!(fills[0].last_px, Price::from("5000"));
+        assert_eq!(fills[1].last_qty, Quantity::from("100"));
+        assert_eq!(fills[1].last_px, Price::from("5001"));
+        assert_eq!(fills[0].commission, Some(Money::from(commission)));
+        assert_eq!(fills[1].commission, Some(Money::zero(seed.currency)));
+    } else {
+        assert!(
+            fills.is_empty(),
+            "unfunded whole batch emitted genuine fills: {fills:?}"
+        );
+        assert_eq!(cached.status(), OrderStatus::Rejected);
+        assert_eq!(cached.filled_qty(), Quantity::from("0"));
+        assert!(matches!(messages.last(), Some(OrderEventAny::Rejected(_))));
+        assert!(!engine.order_exists(order.client_order_id()));
+        engine.fill_market_order(order.client_order_id());
+        assert_eq!(events.get_messages().len(), messages.len());
+        assert!(
+            cache
+                .borrow()
+                .positions(None, None, None, None, None)
+                .is_empty()
+        );
+        if native_funding {
+            assert_eq!(
+                cache
+                    .borrow()
+                    .account_owned(&account_id)
+                    .unwrap()
+                    .events()
+                    .len(),
+                1
+            );
+        }
+        if !native_funding || seed.currency != instrument.quote_currency() {
+            return;
+        }
+        // A second, affordable order on the same quote must still get the original top price
+        let mut second = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100"))
+            .time_in_force(time_in_force)
+            .client_order_id(ClientOrderId::from("CASH-BATCH-2"))
+            .build();
+        submit_cash_test_order(&mut second, account_id);
+        cache
+            .borrow_mut()
+            .add_order(second.clone(), None, None, false)
+            .unwrap();
+        engine.process_order(&mut second, account_id);
+        let messages = events.get_messages();
+        let second_fill = messages
+            .iter()
+            .find_map(|event| match event {
+                OrderEventAny::Filled(fill) if fill.client_order_id == second.client_order_id() => {
+                    Some(fill)
+                }
+                _ => None,
+            })
+            .expect("rejected order must not consume liquidity");
+        assert_eq!(second_fill.last_px, Price::from("5000"));
+        assert_eq!(second_fill.last_qty, Quantity::from("100"));
+        assert_eq!(second_fill.commission, Some(Money::from(commission)));
+        let second_cached = cache
+            .borrow()
+            .order(&second.client_order_id())
+            .unwrap()
+            .clone();
+        assert_eq!(second_cached.status(), OrderStatus::Filled);
+        assert_eq!(second_cached.filled_qty(), Quantity::from("100"));
+    }
+}
+
+#[rstest]
+#[case::fully_liquid("1000000 IDR", "200", false, None, vec![("200", "5000")])]
+#[case::protected_remainder("1000100 IDR", "100", false, Some(1), vec![("100", "5000"), ("100", "5001")])]
+#[case::slipped_funded("1000300 IDR", "100", true, Some(2), vec![("100", "5001"), ("100", "5002")])]
+#[case::slipped_unfunded("1000100 IDR", "100", true, None, vec![])]
+#[case::protection_truncated("500000 IDR", "100", false, Some(0), vec![("100", "5000")])]
+fn test_cash_market_protection_slippage_and_liquidity(
+    #[case] seed: &str,
+    #[case] top_quantity: &str,
+    #[case] slip: bool,
+    #[case] protection: Option<u32>,
+    #[case] expected: Vec<(&str, &str)>,
+    #[values(TimeInForce::Day, TimeInForce::Gtc)] time_in_force: TimeInForce,
+) {
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        seed,
+        true,
+        OrderMatchingEngineConfig {
+            price_protection_points: protection,
+            ..Default::default()
+        },
+        FeeModelHandle::default(),
+        FillModelAny::Default(
+            DefaultFillModel::new(1.0, if slip { 1.0 } else { 0.0 }, Some(42)).unwrap(),
+        )
+        .into(),
+        AccountType::Cash,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("5000"),
+        Price::from("5000"),
+        Quantity::from(top_quantity),
+        Quantity::from(top_quantity),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200"))
+        .time_in_force(time_in_force)
+        .client_order_id("CASH-PROTECTED".into())
+        .build();
+    submit_cash_test_order(&mut order, account_id);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+    let actual = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.last_qty, fill.last_px)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|(quantity, price)| (Quantity::from(*quantity), Price::from(*price)))
+            .collect::<Vec<_>>()
+    );
+    let cached = cache
+        .borrow()
+        .order(&order.client_order_id())
+        .unwrap()
+        .clone();
+    assert_eq!(cached.quantity(), Quantity::from("200"));
+    assert_eq!(
+        cached.status(),
+        if expected.is_empty() {
+            OrderStatus::Rejected
+        } else if top_quantity == "100" && protection == Some(0) {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::Filled
+        }
+    );
+}
+
+#[derive(Clone, Copy)]
+enum CashTestFeeBehavior {
+    Count,
+    FailAfterFirst,
+    FutureRebate,
+}
+
+struct CashTestFeeModel {
+    calls: Rc<Cell<usize>>,
+    behavior: CashTestFeeBehavior,
+}
+
+impl FeeModel for CashTestFeeModel {
+    fn get_commission(
+        &self,
+        order: &OrderAny,
+        _quantity: Quantity,
+        _price: Price,
+        _instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.calls.set(self.calls.get() + 1);
+        let first = order.filled_qty().is_zero();
+        match self.behavior {
+            CashTestFeeBehavior::Count => Ok(Money::from("0 IDR")),
+            CashTestFeeBehavior::FailAfterFirst if !first => {
+                anyhow::bail!("fixture fee failure on later fill")
+            }
+            CashTestFeeBehavior::FailAfterFirst => Ok(Money::from("0 IDR")),
+            CashTestFeeBehavior::FutureRebate => {
+                Ok(Money::from(if first { "1 IDR" } else { "-500101 IDR" }))
+            }
+        }
+    }
+}
+
+#[rstest]
+#[case::counted("2000000 IDR", CashTestFeeBehavior::Count, true, 2)]
+#[case::later_fee_failure("2000000 IDR", CashTestFeeBehavior::FailAfterFirst, false, 2)]
+#[case::future_rebate_cannot_fund_first_debit(
+    "500000 IDR",
+    CashTestFeeBehavior::FutureRebate,
+    false,
+    1
+)]
+fn test_cash_market_fee_preview_once_or_rejection(
+    #[case] seed: &str,
+    #[case] behavior: CashTestFeeBehavior,
+    #[case] funded: bool,
+    #[case] expected_calls: usize,
+    #[values(TimeInForce::Day, TimeInForce::Gtc)] time_in_force: TimeInForce,
+) {
+    let calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        seed,
+        true,
+        OrderMatchingEngineConfig::default(),
+        FeeModelHandle::new(CashTestFeeModel {
+            calls: calls.clone(),
+            behavior,
+        }),
+        FillModelHandle::default(),
+        AccountType::Cash,
+        false,
+    );
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200"))
+        .time_in_force(time_in_force)
+        .client_order_id("CASH-FEE-PREVIEW".into())
+        .build();
+    submit_cash_test_order(&mut order, account_id);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+    assert_eq!(calls.get(), expected_calls);
+    let count = events
+        .get_messages()
+        .iter()
+        .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+        .count();
+    assert_eq!(count, if funded { 2 } else { 0 });
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .status(),
+        if funded {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::Rejected
+        }
+    );
+}
+
+#[rstest]
+fn test_cash_market_unsupported_contingency_rejects_without_releasing_child(
+    #[values(TimeInForce::Day, TimeInForce::Gtc)] time_in_force: TimeInForce,
+) {
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "2000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            support_contingent_orders: true,
+            liquidity_consumption: true,
+            ..Default::default()
+        },
+        FeeModelHandle::default(),
+        FillModelHandle::default(),
+        AccountType::Cash,
+        false,
+    );
+    let parent_id = ClientOrderId::from("CASH-OTO-PARENT");
+    let child_id = ClientOrderId::from("CASH-OTO-CHILD");
+    let list_id = OrderListId::from("CASH-OTO-LIST");
+    let child = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("100"))
+        .price(Price::from("6000"))
+        .client_order_id(child_id)
+        .order_list_id(list_id)
+        .parent_order_id(parent_id)
+        .build();
+    let mut parent = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200"))
+        .time_in_force(time_in_force)
+        .client_order_id(parent_id)
+        .order_list_id(list_id)
+        .contingency_type(ContingencyType::Oto)
+        .linked_order_ids(vec![child_id])
+        .build();
+    submit_cash_test_order(&mut parent, account_id);
+    cache
+        .borrow_mut()
+        .add_order(child, None, None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_order(parent.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut parent, account_id);
+    let messages = events.get_messages();
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(messages[0], OrderEventAny::Rejected(_)));
+    let cache = cache.borrow();
+    assert_eq!(
+        cache.order(&parent_id).unwrap().status(),
+        OrderStatus::Rejected
+    );
+    assert_eq!(
+        cache.order(&parent_id).unwrap().quantity(),
+        Quantity::from("200")
+    );
+    assert_eq!(
+        cache.order(&child_id).unwrap().status(),
+        OrderStatus::Initialized
+    );
+    assert_eq!(
+        cache.order(&child_id).unwrap().filled_qty(),
+        Quantity::from("0")
+    );
+}
+
+#[rstest]
+#[case::borrowed_cash(AccountType::Cash, true, OrderType::Market, OrderStatus::Filled)]
+#[case::margin(AccountType::Margin, false, OrderType::Market, OrderStatus::Filled)]
+#[case::cash_limit(
+    AccountType::Cash,
+    false,
+    OrderType::Limit,
+    OrderStatus::PartiallyFilled
+)]
+fn test_cash_market_guard_preserves_other_native_paths(
+    #[case] account_type: AccountType,
+    #[case] borrowing: bool,
+    #[case] order_type: OrderType,
+    #[case] expected: OrderStatus,
+    #[values(TimeInForce::Day, TimeInForce::Gtc)] time_in_force: TimeInForce,
+) {
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "1000000 IDR",
+        true,
+        OrderMatchingEngineConfig::default(),
+        FeeModelHandle::default(),
+        FillModelHandle::default(),
+        account_type,
+        borrowing,
+    );
+    let mut builder = OrderTestBuilder::new(order_type);
+    builder
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200"))
+        .time_in_force(time_in_force)
+        .client_order_id("CASH-OTHER-PATH".into());
+    if order_type == OrderType::Limit {
+        builder.price(Price::from("5000"));
+    }
+    let mut order = builder.build();
+    submit_cash_test_order(&mut order, account_id);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .status(),
+        expected
+    );
+    let actual = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.last_qty, fill.last_px)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        if order_type == OrderType::Limit {
+            vec![(Quantity::from("100"), Price::from("5000"))]
+        } else {
+            vec![
+                (Quantity::from("100"), Price::from("5000")),
+                (Quantity::from("100"), Price::from("5001")),
+            ]
+        }
+    );
 }
 
 #[rstest]
@@ -11822,7 +12478,6 @@ fn test_fully_filled_market_to_limit_not_in_core(
 #[rstest]
 fn test_l1_ask_tracks_decreasing_seller_trade_prices(
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
-    account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
 ) {
     // Previously the ask only monotonically increased and the restore block
@@ -11832,8 +12487,11 @@ fn test_l1_ask_tracks_decreasing_seller_trade_prices(
         trade_execution: true,
         ..Default::default()
     };
-    let mut engine =
-        get_order_matching_engine(instrument_eth_usdt.clone(), None, None, None, Some(config));
+    let (mut engine, account_id) = funded_l1_cash_test_engine(
+        instrument_eth_usdt.clone(),
+        config,
+        FillModelHandle::default(),
+    );
 
     let quote = QuoteTick::new(
         instrument_eth_usdt.id(),
@@ -11867,8 +12525,8 @@ fn test_l1_ask_tracks_decreasing_seller_trade_prices(
         .side(OrderSide::Buy)
         .quantity(Quantity::from("1.000"))
         .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
-        .submit(true)
         .build();
+    submit_cash_test_order(&mut market_order, account_id);
     engine.process_order(&mut market_order, account_id);
 
     let saved_messages = get_order_event_handler_messages(&order_event_handler);
@@ -11957,7 +12615,6 @@ fn test_l1_bid_tracks_increasing_buyer_trade_prices(
 #[rstest]
 fn test_l1_sequential_trades_alternating_aggressors(
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
-    account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
 ) {
     // Mixed aggressor sides: verify fill prices match the latest trade
@@ -11966,8 +12623,11 @@ fn test_l1_sequential_trades_alternating_aggressors(
         trade_execution: true,
         ..Default::default()
     };
-    let mut engine =
-        get_order_matching_engine(instrument_eth_usdt.clone(), None, None, None, Some(config));
+    let (mut engine, account_id) = funded_l1_cash_test_engine(
+        instrument_eth_usdt.clone(),
+        config,
+        FillModelHandle::default(),
+    );
 
     let quote = QuoteTick::new(
         instrument_eth_usdt.id(),
@@ -12006,8 +12666,8 @@ fn test_l1_sequential_trades_alternating_aggressors(
         .side(OrderSide::Buy)
         .quantity(Quantity::from("1.000"))
         .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
-        .submit(true)
         .build();
+    submit_cash_test_order(&mut buy_order, account_id);
     engine.process_order(&mut buy_order, account_id);
 
     let saved_messages = get_order_event_handler_messages(&order_event_handler);
@@ -12029,7 +12689,6 @@ fn test_l1_sequential_trades_alternating_aggressors(
 #[rstest]
 fn test_l1_trade_only_no_initial_quote_ask_tracks_price(
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
-    account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
 ) {
     // The exact scenario from the bug report: trade-only data with no quotes.
@@ -12041,21 +12700,8 @@ fn test_l1_trade_only_no_initial_quote_ask_tracks_price(
         trade_execution: true,
         ..Default::default()
     };
-    let clock = Rc::new(RefCell::new(TestClock::new()));
-    let cache = Rc::new(RefCell::new(Cache::default()));
-
-    let mut engine = OrderMatchingEngine::new(
-        instrument_eth_usdt.clone(),
-        1,
-        fill_model.into(),
-        FeeModelAny::default().into(),
-        BookType::L1_MBP,
-        OmsType::Netting,
-        AccountType::Cash,
-        clock,
-        cache,
-        config,
-    );
+    let (mut engine, account_id) =
+        funded_l1_cash_test_engine(instrument_eth_usdt.clone(), config, fill_model.into());
 
     // No quote: only trade ticks, seller trades at 100 -> 105 -> 90
     for (i, price_str) in ["100.00", "105.00", "90.00"].iter().enumerate() {
@@ -12077,8 +12723,8 @@ fn test_l1_trade_only_no_initial_quote_ask_tracks_price(
         .side(OrderSide::Buy)
         .quantity(Quantity::from("1.000"))
         .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
-        .submit(true)
         .build();
+    submit_cash_test_order(&mut market_order, account_id);
     engine.process_order(&mut market_order, account_id);
 
     let saved_messages = get_order_event_handler_messages(&order_event_handler);
@@ -12100,7 +12746,6 @@ fn test_l1_trade_only_no_initial_quote_ask_tracks_price(
 #[rstest]
 fn test_l1_no_aggressor_trades_track_price(
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
-    account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
 ) {
     // NoAggressor trades (common in some data feeds) must also track price
@@ -12109,8 +12754,11 @@ fn test_l1_no_aggressor_trades_track_price(
         trade_execution: true,
         ..Default::default()
     };
-    let mut engine =
-        get_order_matching_engine(instrument_eth_usdt.clone(), None, None, None, Some(config));
+    let (mut engine, account_id) = funded_l1_cash_test_engine(
+        instrument_eth_usdt.clone(),
+        config,
+        FillModelHandle::default(),
+    );
 
     let quote = QuoteTick::new(
         instrument_eth_usdt.id(),
@@ -12142,8 +12790,8 @@ fn test_l1_no_aggressor_trades_track_price(
         .side(OrderSide::Buy)
         .quantity(Quantity::from("1.000"))
         .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
-        .submit(true)
         .build();
+    submit_cash_test_order(&mut market_order, account_id);
     engine.process_order(&mut market_order, account_id);
 
     let saved_messages = get_order_event_handler_messages(&order_event_handler);
@@ -15698,13 +16346,16 @@ fn test_option_cash_settlement_uses_instrument_close_price(account_id: AccountId
 #[case(OrderSide::Sell, "1000.00", "999.99")]
 fn test_l1_market_order_slips_remainder_through_next_tick(
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
-    account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
     #[case] side: OrderSide,
     #[case] top_of_book_px: &str,
     #[case] slip_px: &str,
 ) {
-    let mut engine = get_order_matching_engine(instrument_eth_usdt.clone(), None, None, None, None);
+    let (mut engine, account_id) = funded_l1_cash_test_engine(
+        instrument_eth_usdt.clone(),
+        OrderMatchingEngineConfig::default(),
+        FillModelHandle::default(),
+    );
 
     let quote = QuoteTick::new(
         instrument_eth_usdt.id(),
@@ -15722,8 +16373,8 @@ fn test_l1_market_order_slips_remainder_through_next_tick(
         .side(side)
         .quantity(Quantity::from("1.500"))
         .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
-        .submit(true)
         .build();
+    submit_cash_test_order(&mut market_order, account_id);
     engine.process_order(&mut market_order, account_id);
 
     let fills: Vec<OrderFilled> = get_order_event_handler_messages(&order_event_handler)
@@ -15860,7 +16511,6 @@ fn test_reduce_only_l1_market_order_slip_caps_remaining_position(
 #[case(OrderSide::Sell, "1000.00")]
 fn test_l1_market_order_slip_respects_protection_boundary(
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
-    account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
     #[case] side: OrderSide,
     #[case] top_of_book_px: &str,
@@ -15869,8 +16519,11 @@ fn test_l1_market_order_slip_respects_protection_boundary(
     let config = OrderMatchingEngineConfig::builder()
         .price_protection_points(0u32)
         .build();
-    let mut engine =
-        get_order_matching_engine(instrument_eth_usdt.clone(), None, None, None, Some(config));
+    let (mut engine, account_id) = funded_l1_cash_test_engine(
+        instrument_eth_usdt.clone(),
+        config,
+        FillModelHandle::default(),
+    );
 
     let quote = QuoteTick::new(
         instrument_eth_usdt.id(),
@@ -15888,8 +16541,8 @@ fn test_l1_market_order_slip_respects_protection_boundary(
         .side(side)
         .quantity(Quantity::from("1.500"))
         .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
-        .submit(true)
         .build();
+    submit_cash_test_order(&mut market_order, account_id);
     engine.process_order(&mut market_order, account_id);
 
     let fills: Vec<OrderFilled> = get_order_event_handler_messages(&order_event_handler)
@@ -15910,7 +16563,6 @@ fn test_l1_market_order_slip_respects_protection_boundary(
 #[case(OrderSide::Sell, "1000.00", "999.99")]
 fn test_l1_market_order_slip_allowed_at_protection_boundary(
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
-    account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
     #[case] side: OrderSide,
     #[case] top_of_book_px: &str,
@@ -15921,8 +16573,11 @@ fn test_l1_market_order_slip_allowed_at_protection_boundary(
     let config = OrderMatchingEngineConfig::builder()
         .price_protection_points(1u32)
         .build();
-    let mut engine =
-        get_order_matching_engine(instrument_eth_usdt.clone(), None, None, None, Some(config));
+    let (mut engine, account_id) = funded_l1_cash_test_engine(
+        instrument_eth_usdt.clone(),
+        config,
+        FillModelHandle::default(),
+    );
 
     let quote = QuoteTick::new(
         instrument_eth_usdt.id(),
@@ -15940,8 +16595,8 @@ fn test_l1_market_order_slip_allowed_at_protection_boundary(
         .side(side)
         .quantity(Quantity::from("1.500"))
         .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
-        .submit(true)
         .build();
+    submit_cash_test_order(&mut market_order, account_id);
     engine.process_order(&mut market_order, account_id);
 
     let fills: Vec<OrderFilled> = get_order_event_handler_messages(&order_event_handler)

@@ -24,7 +24,7 @@ use nautilus_model::{
     accounts::{
         Account, AccountAny, BaseAccount, BettingAccount, CashAccount, MarginAccount, WalletAccount,
     },
-    enums::{AccountType, OrderSide, OrderType, PriceType},
+    enums::{AccountType, LiquiditySide, OrderSide, OrderType, PriceType},
     events::{AccountState, OrderFilled},
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
@@ -428,6 +428,43 @@ impl AccountsManager {
                     return None;
                 }
             };
+
+            // A single-currency CASH BUY also locks its commission at the worse fee rate, as the
+            // matching engine's CASH LIMIT admission requires
+            if order.order_side() == OrderSide::Buy
+                && !account.allow_borrowing
+                && account.base_currency() == Some(locked.currency)
+                && locked.currency == instrument.quote_currency()
+                && account.balances().len() == 1
+            {
+                let liquidity_side = if instrument.maker_fee() > instrument.taker_fee() {
+                    LiquiditySide::Maker
+                } else {
+                    LiquiditySide::Taker
+                };
+                let commission = match account.calculate_commission(
+                    instrument,
+                    order.leaves_qty(),
+                    price?,
+                    liquidity_side,
+                    None,
+                ) {
+                    Ok(commission) => commission,
+                    Err(e) => {
+                        log::error!("Cannot calculate balance locked commission: {e}");
+                        return None;
+                    }
+                };
+                if commission.currency == locked.currency && commission.is_positive() {
+                    let Some(sum) = locked.checked_add(commission) else {
+                        log::error!(
+                            "Cannot calculate balance locked: commission exceeds Money bounds"
+                        );
+                        return None;
+                    };
+                    locked = sum;
+                }
+            }
 
             if let Some(base_curr) = account.base_currency() {
                 if let Some(xrate) = self.calculate_xrate_to_base(
@@ -1613,8 +1650,9 @@ mod tests {
         if let AccountAny::Cash(cash_account) = updated_account {
             let locked_balance = cash_account.balance_locked(Some(usd));
 
-            // Order 1: 100k * 0.75 = 75k, Order 2: 50k * 0.745 = 37.25k, Order 3: 75k * 0.74 = 55.5k
-            let expected_locked = Money::new(167_750.0, usd);
+            // Order 1: 100k * 0.75 = 75k, Order 2: 50k * 0.745 = 37.25k, Order 3: 75k * 0.74 = 55.5k,
+            // plus each BUY's commission at the 0.00002 fee: 1.50 + 0.74 (0.745 rounded) + 1.11
+            let expected_locked = Money::new(167_753.35, usd);
 
             assert_eq!(locked_balance, Some(expected_locked));
             let aud = Currency::AUD();
@@ -1679,13 +1717,14 @@ mod tests {
             cash.balance_total(Some(usd)),
             Some(Money::new(1_000_000.0, usd))
         );
+        // Notional 100k * 0.80 = 80k plus commission at the 0.00002 fee = 1.60
         assert_eq!(
             cash.balance_locked(Some(usd)),
-            Some(Money::new(80_000.0, usd))
+            Some(Money::new(80_001.6, usd))
         );
         assert_eq!(
             cash.balance_free(Some(usd)),
-            Some(Money::new(920_000.0, usd))
+            Some(Money::new(919_998.4, usd))
         );
 
         let fill = OrderFilledSpec::builder()
@@ -1723,13 +1762,14 @@ mod tests {
             account.balance_total(Some(usd)),
             Some(Money::new(968_392.0, usd))
         );
+        // Leaves 60k * 0.80 = 48k plus commission at the 0.00002 fee = 0.96
         assert_eq!(
             account.balance_locked(Some(usd)),
-            Some(Money::new(48_000.0, usd))
+            Some(Money::new(48_000.96, usd))
         );
         assert_eq!(
             account.balance_free(Some(usd)),
-            Some(Money::new(920_392.0, usd))
+            Some(Money::new(920_391.04, usd))
         );
         assert_eq!(account.commission(&usd), Some(Money::new(8.0, usd)));
     }
@@ -3558,14 +3598,14 @@ mod tests {
         let (updated_account, _) = result.unwrap();
 
         if let AccountAny::Cash(ref cash) = updated_account {
-            // 100k * 0.80 = 80k USD locked
+            // 100k * 0.80 = 80k USD plus commission at the 0.00002 fee = 1.60 USD locked
             assert_eq!(
                 cash.balance_locked(Some(usd)),
-                Some(Money::new(80_000.0, usd))
+                Some(Money::new(80_001.6, usd))
             );
             assert_eq!(
                 cash.balance_free(Some(usd)),
-                Some(Money::new(20_000.0, usd))
+                Some(Money::new(19_998.4, usd))
             );
         } else {
             panic!("Expected CashAccount");

@@ -38,7 +38,8 @@ use nautilus_core::{
 use nautilus_execution::{
     matching_core::RestingOrder,
     matching_engine::{
-        OrderMatchingEngine, config::OrderMatchingEngineConfig, inflight::InflightOrders,
+        OrderMatchingEngine, cash_commitments::CashCommitments, config::OrderMatchingEngineConfig,
+        inflight::InflightOrders,
     },
     models::{
         fee::FeeModelHandle,
@@ -173,6 +174,7 @@ pub struct SimulatedExchange {
     message_queue: VecDeque<TradingCommand>,
     inflight_queue: BinaryHeap<InflightCommand>,
     inflight_orders: InflightOrders,
+    cash_commitments: CashCommitments,
     inflight_counter: AHashMap<UnixNanos, u32>,
     bar_execution: bool,
     bar_adaptive_high_low_ordering: bool,
@@ -263,6 +265,7 @@ impl SimulatedExchange {
             message_queue: VecDeque::new(),
             inflight_queue: BinaryHeap::new(),
             inflight_orders: InflightOrders::default(),
+            cash_commitments: CashCommitments::default(),
             inflight_counter: AHashMap::new(),
             bar_execution: config.bar_execution,
             bar_adaptive_high_low_ordering: config.bar_adaptive_high_low_ordering,
@@ -512,6 +515,7 @@ impl SimulatedExchange {
         }
         self.instruments.insert(instrument_id, instrument);
         matching_engine.set_inflight_orders(self.inflight_orders.clone());
+        matching_engine.set_cash_commitments(self.cash_commitments.clone());
         self.matching_engines.insert(instrument_id, matching_engine);
 
         log::info!("Added instrument {instrument_id} and created matching engine");
@@ -1719,6 +1723,7 @@ impl SimulatedExchange {
         self.message_queue.clear();
         self.inflight_queue.clear();
         self.inflight_orders.clear();
+        self.cash_commitments.clear();
         self.inflight_counter.clear();
 
         log::info!("Resetting exchange state");
