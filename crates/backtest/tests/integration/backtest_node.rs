@@ -20,7 +20,12 @@
 //! Tests that arm shutdown-on-error use global logging state. Run with cargo-nextest for process
 //! isolation, or use --test-threads=1.
 
-use std::{cell::RefCell, fmt::Debug, rc::Rc, str::FromStr};
+use std::{
+    cell::{Cell, RefCell},
+    fmt::Debug,
+    rc::Rc,
+    str::FromStr,
+};
 
 use nautilus_backtest::{
     config::{
@@ -31,15 +36,22 @@ use nautilus_backtest::{
 };
 use nautilus_common::actor::DataActor;
 use nautilus_core::UnixNanos;
+use nautilus_execution::models::fill::{FillModel, FillModelAny, FillModelHandle};
 use nautilus_model::{
+    accounts::Account,
     data::{BarSpecification, BookOrder, FundingRateUpdate, OrderBookDelta, QuoteTick, TradeTick},
     enums::{
-        AccountType, AggressorSide, BarAggregation, BookAction, BookType, OmsType, OrderSide,
-        PriceType,
+        AccountType, AggressorSide, BarAggregation, BookAction, BookType, CurrencyType, OmsType,
+        OrderSide, OrderStatus, PriceType, TimeInForce,
     },
-    identifiers::{InstrumentId, StrategyId, TradeId},
-    instruments::{CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
-    types::{Price, Quantity},
+    events::OrderFilled,
+    identifiers::{AccountId, InstrumentId, StrategyId, Symbol, TradeId},
+    instruments::{
+        CryptoPerpetual, Equity, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
+    },
+    orderbook::OrderBook,
+    orders::{Order, OrderAny},
+    types::{Currency, Money, Price, Quantity},
 };
 use nautilus_persistence::backend::catalog::ParquetDataCatalog;
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
@@ -1567,4 +1579,280 @@ fn test_streaming_same_timestamp_events(crypto_perpetual_ethusdt: CryptoPerpetua
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].iterations, 12);
+}
+
+// A single static reference-period grid. This test model is deliberately not a
+// provider rule registry or approval of prices outside its two stated neighbors.
+struct StaticGridFillModel;
+
+impl FillModel for StaticGridFillModel {
+    fn is_limit_filled(&mut self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn is_slipped(&mut self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn next_price(
+        &self,
+        _instrument: &InstrumentAny,
+        price: Price,
+        side: OrderSide,
+    ) -> anyhow::Result<Price> {
+        if price != Price::from("9200") {
+            anyhow::bail!("static fixture has no step from {price}");
+        }
+        Ok(match side {
+            OrderSide::Buy => Price::from("9225"),
+            OrderSide::Sell => Price::from("9175"),
+        })
+    }
+
+    fn get_orderbook_for_fill_simulation(
+        &mut self,
+        _instrument: &InstrumentAny,
+        _order: &OrderAny,
+        _best_bid: Price,
+        _best_ask: Price,
+    ) -> anyhow::Result<Option<OrderBook>> {
+        Ok(None)
+    }
+}
+
+struct StaticGridMarketStrategy {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    submitted: bool,
+    first_quote_ts: Rc<Cell<Option<UnixNanos>>>,
+    fills: Rc<RefCell<Vec<OrderFilled>>>,
+}
+
+impl StaticGridMarketStrategy {
+    fn new(
+        instrument_id: InstrumentId,
+        run: usize,
+        first_quote_ts: Rc<Cell<Option<UnixNanos>>>,
+        fills: Rc<RefCell<Vec<OrderFilled>>>,
+    ) -> Self {
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from(format!("STATIC-GRID-{run}").as_str())),
+            order_id_tag: Some("001".to_string()),
+            ..Default::default()
+        };
+        Self {
+            core: StrategyCore::new(config),
+            instrument_id,
+            submitted: false,
+            first_quote_ts,
+            fills,
+        }
+    }
+}
+
+nautilus_strategy!(StaticGridMarketStrategy, {
+    fn on_order_filled(&mut self, event: &OrderFilled) {
+        self.fills.borrow_mut().push(event.clone());
+    }
+});
+
+impl Debug for StaticGridMarketStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(StaticGridMarketStrategy))
+            .finish()
+    }
+}
+
+impl DataActor for StaticGridMarketStrategy {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes(self.instrument_id, None, None);
+        Ok(())
+    }
+
+    fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        if self.submitted {
+            return Ok(());
+        }
+        self.submitted = true;
+        self.first_quote_ts.set(Some(quote.ts_event));
+        let order = self.order().market(
+            self.instrument_id,
+            OrderSide::Buy,
+            Quantity::from("100"),
+            Some(TimeInForce::Gtc),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        self.submit_order(order, None, None, None)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StaticGridObservation {
+    fill_price: Price,
+    fill_quantity: Quantity,
+    commission: Option<Money>,
+    cash_total: Money,
+    cash_free: Money,
+    order_quantity: Quantity,
+    position_quantity: Quantity,
+    portfolio_position: Decimal,
+    first_quote_ts: UnixNanos,
+    fill_ts: UnixNanos,
+}
+
+fn run_static_grid_backtest(
+    run: usize,
+    catalog_path: &str,
+    instrument_id: InstrumentId,
+    idr: Currency,
+) -> StaticGridObservation {
+    let venue = BacktestVenueConfig::builder()
+        .name(Ustr::from("XIDX"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec!["1000000000 IDR".to_string()])
+        .base_currency(idr)
+        .fill_model(FillModelAny::Custom(FillModelHandle::new(
+            StaticGridFillModel,
+        )))
+        .build()
+        .unwrap();
+    let config = BacktestRunConfig::builder()
+        .id(format!("static-grid-{run}"))
+        .venues(vec![venue])
+        .data(vec![data_config(catalog_path, instrument_id)])
+        .dispose_on_completion(false)
+        .build()
+        .unwrap();
+    let config_id = config.id().to_string();
+    let first_quote_ts = Rc::new(Cell::new(None));
+    let fills = Rc::new(RefCell::new(Vec::new()));
+    let mut node = BacktestNode::new(vec![config]).unwrap();
+    node.build().unwrap();
+    {
+        let engine = node.get_engine_mut(&config_id).unwrap();
+        engine
+            .add_strategy(StaticGridMarketStrategy::new(
+                instrument_id,
+                run,
+                first_quote_ts.clone(),
+                fills.clone(),
+            ))
+            .unwrap();
+    }
+    let results = node.run().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].iterations, 2);
+    assert_eq!(results[0].total_orders, 1);
+    assert_eq!(results[0].total_positions, 1);
+
+    let fills = fills.borrow();
+    assert_eq!(
+        fills.len(),
+        1,
+        "native strategy saw duplicate or missing Fill"
+    );
+    let fill = &fills[0];
+    let first_quote_ts = first_quote_ts.get().expect("strategy received first quote");
+    assert_eq!(first_quote_ts, UnixNanos::from(1_000_000_000u64));
+    assert!(fill.ts_event >= first_quote_ts);
+    assert!(fill.ts_event < UnixNanos::from(2_000_000_000u64));
+
+    let engine = node.get_engine(&config_id).unwrap();
+    let cache = engine.kernel().cache.borrow();
+    let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].status(), OrderStatus::Filled);
+    assert_eq!(orders[0].filled_qty(), Quantity::from("100"));
+    let positions = cache.positions(None, Some(&instrument_id), None, None, None);
+    assert_eq!(positions.len(), 1);
+    let account = cache.account(&AccountId::from("XIDX-001")).unwrap();
+    assert_eq!(account.account_type(), AccountType::Cash);
+    let balance = account
+        .balance(Some(idr))
+        .expect("native IDR CashAccount balance");
+    let observation = StaticGridObservation {
+        fill_price: fill.last_px,
+        fill_quantity: fill.last_qty,
+        commission: fill.commission,
+        cash_total: balance.total,
+        cash_free: balance.free,
+        order_quantity: orders[0].filled_qty(),
+        position_quantity: positions[0].quantity,
+        portfolio_position: engine.kernel().portfolio().net_position(&instrument_id),
+        first_quote_ts,
+        fill_ts: fill.ts_event,
+    };
+    observation
+}
+
+#[test]
+fn test_backtest_node_custom_static_grid_applies_native_fee_and_cash() {
+    Currency::register(
+        Currency::new("IDR", 2, 360, "Indonesian rupiah", CurrencyType::Fiat),
+        false,
+    )
+    .unwrap();
+    let idr = Currency::from("IDR");
+    let instrument = InstrumentAny::Equity(
+        Equity::builder()
+            .instrument_id(InstrumentId::from("BBCA.XIDX"))
+            .raw_symbol(Symbol::from("BBCA"))
+            .currency(idr)
+            .price_precision(0)
+            .price_increment(Price::from("1"))
+            .lot_size(Quantity::from("100"))
+            .maker_fee(Decimal::from_str("0.0015").unwrap())
+            .taker_fee(Decimal::from_str("0.0025").unwrap())
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap(),
+    );
+    let temp_dir = TempDir::new().unwrap();
+    let catalog_path = temp_dir.path().to_str().unwrap();
+    let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+    catalog.write_instruments(vec![instrument.clone()]).unwrap();
+    let quotes = [
+        QuoteTick::new(
+            instrument.id(),
+            Price::from("9200"),
+            Price::from("9200"),
+            Quantity::from("100"),
+            Quantity::from("100"),
+            UnixNanos::from(1_000_000_000u64),
+            UnixNanos::from(1_000_000_000u64),
+        ),
+        QuoteTick::new(
+            instrument.id(),
+            Price::from("9300"),
+            Price::from("9300"),
+            Quantity::from("100"),
+            Quantity::from("100"),
+            UnixNanos::from(2_000_000_000u64),
+            UnixNanos::from(2_000_000_000u64),
+        ),
+    ];
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
+
+    let first = run_static_grid_backtest(1, catalog_path, instrument.id(), idr);
+    let second = run_static_grid_backtest(2, catalog_path, instrument.id(), idr);
+    assert_eq!(
+        first, second,
+        "fresh model per run changed native financial result"
+    );
+    assert_eq!(first.fill_price, Price::from("9225"));
+    assert_eq!(first.fill_quantity, Quantity::from("100"));
+    assert_eq!(first.commission, Some(Money::from("2306.25 IDR")));
+    assert_eq!(first.cash_total, Money::from("999075193.75 IDR"));
+    assert_eq!(first.cash_free, Money::from("999075193.75 IDR"));
+    assert_eq!(first.order_quantity, Quantity::from("100"));
+    assert_eq!(first.position_quantity, Quantity::from("100"));
+    assert_eq!(first.portfolio_position, Decimal::from_str("100").unwrap());
 }

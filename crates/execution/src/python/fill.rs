@@ -243,6 +243,9 @@ pub fn fill_model_any_to_pyobject(py: Python<'_>, model: &FillModelAny) -> PyRes
         FillModelAny::CompetitionAware(model) => Ok(Py::new(py, model.clone())?.into_any()),
         FillModelAny::VolumeSensitive(model) => Ok(Py::new(py, model.clone())?.into_any()),
         FillModelAny::MarketHours(model) => Ok(Py::new(py, model.clone())?.into_any()),
+        FillModelAny::Custom(_) => Err(pyo3::exceptions::PyTypeError::new_err(
+            "Rust custom fill models cannot be converted to Python objects",
+        )),
     }
 }
 

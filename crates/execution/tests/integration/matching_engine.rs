@@ -754,9 +754,1265 @@ fn test_cash_market_protection_slippage_and_liquidity(
     );
 }
 
+struct ProtectionStepFillModel {
+    slip: Rc<Cell<bool>>,
+    fail_step: Option<Rc<Cell<bool>>>,
+}
+
+struct ScriptedSlipFillModel {
+    calls: Rc<Cell<usize>>,
+    next_calls: Rc<Cell<usize>>,
+}
+
+#[derive(Clone, Copy)]
+enum InvalidOkStep {
+    Fraction,
+    WrongDirection,
+    ErrorSentinel,
+}
+
+impl InvalidOkStep {
+    fn price(self, side: OrderSide) -> Price {
+        match (self, side) {
+            (Self::Fraction, OrderSide::Buy) => Price::from("9225.5"),
+            (Self::Fraction, OrderSide::Sell) => Price::from("9174.5"),
+            (Self::WrongDirection, OrderSide::Buy) => Price::from("9175"),
+            (Self::WrongDirection, OrderSide::Sell) => Price::from("9225"),
+            (Self::ErrorSentinel, _) => nautilus_model::types::ERROR_PRICE,
+        }
+    }
+}
+
+struct InvalidOkFillModel {
+    slip: Rc<Cell<bool>>,
+    step: InvalidOkStep,
+}
+
+impl FillModel for InvalidOkFillModel {
+    fn is_limit_filled(&mut self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn is_slipped(&mut self) -> anyhow::Result<bool> {
+        Ok(self.slip.get())
+    }
+
+    fn next_price(
+        &self,
+        _instrument: &InstrumentAny,
+        _price: Price,
+        side: OrderSide,
+    ) -> anyhow::Result<Price> {
+        Ok(self.step.price(side))
+    }
+
+    fn get_orderbook_for_fill_simulation(
+        &mut self,
+        _instrument: &InstrumentAny,
+        _order: &OrderAny,
+        _best_bid: Price,
+        _best_ask: Price,
+    ) -> anyhow::Result<Option<OrderBook>> {
+        Ok(None)
+    }
+}
+
+impl FillModel for ScriptedSlipFillModel {
+    fn is_limit_filled(&mut self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn is_slipped(&mut self) -> anyhow::Result<bool> {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        Ok(call == 1)
+    }
+
+    fn next_price(
+        &self,
+        instrument: &InstrumentAny,
+        price: Price,
+        side: OrderSide,
+    ) -> anyhow::Result<Price> {
+        self.next_calls.set(self.next_calls.get() + 1);
+        match side {
+            OrderSide::Buy => price.checked_add(instrument.price_increment()),
+            OrderSide::Sell => price.checked_sub(instrument.price_increment()),
+        }
+        .ok_or_else(|| anyhow::anyhow!("Fixture price step overflow"))
+    }
+
+    fn get_orderbook_for_fill_simulation(
+        &mut self,
+        _instrument: &InstrumentAny,
+        _order: &OrderAny,
+        _best_bid: Price,
+        _best_ask: Price,
+    ) -> anyhow::Result<Option<OrderBook>> {
+        Ok(None)
+    }
+}
+
+impl FillModel for ProtectionStepFillModel {
+    fn is_limit_filled(&mut self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn is_slipped(&mut self) -> anyhow::Result<bool> {
+        Ok(self.slip.get())
+    }
+
+    fn next_price(
+        &self,
+        _instrument: &InstrumentAny,
+        price: Price,
+        side: OrderSide,
+    ) -> anyhow::Result<Price> {
+        if self.fail_step.as_ref().is_some_and(|fail| fail.get()) {
+            anyhow::bail!("fixture price step failure");
+        }
+        match side {
+            OrderSide::Buy => price.checked_add(Price::from("25")),
+            OrderSide::Sell => price.checked_sub(Price::from("25")),
+        }
+        .ok_or_else(|| anyhow::anyhow!("Fixture price step overflow"))
+    }
+
+    fn get_orderbook_for_fill_simulation(
+        &mut self,
+        _instrument: &InstrumentAny,
+        _order: &OrderAny,
+        _best_bid: Price,
+        _best_ask: Price,
+    ) -> anyhow::Result<Option<OrderBook>> {
+        Ok(None)
+    }
+}
+
+#[rstest]
+#[case::cash_fraction(AccountType::Cash, OrderSide::Buy, InvalidOkStep::Fraction)]
+#[case::cash_direction(AccountType::Cash, OrderSide::Buy, InvalidOkStep::WrongDirection)]
+#[case::cash_sentinel(AccountType::Cash, OrderSide::Buy, InvalidOkStep::ErrorSentinel)]
+#[case::margin_buy_fraction(AccountType::Margin, OrderSide::Buy, InvalidOkStep::Fraction)]
+#[case::margin_buy_direction(AccountType::Margin, OrderSide::Buy, InvalidOkStep::WrongDirection)]
+#[case::margin_buy_sentinel(AccountType::Margin, OrderSide::Buy, InvalidOkStep::ErrorSentinel)]
+#[case::margin_sell_fraction(AccountType::Margin, OrderSide::Sell, InvalidOkStep::Fraction)]
+#[case::margin_sell_direction(AccountType::Margin, OrderSide::Sell, InvalidOkStep::WrongDirection)]
+#[case::margin_sell_sentinel(AccountType::Margin, OrderSide::Sell, InvalidOkStep::ErrorSentinel)]
+fn test_invalid_ok_price_step_market_initial_preserves_source(
+    #[case] account_type: AccountType,
+    #[case] side: OrderSide,
+    #[case] step: InvalidOkStep,
+    #[values(false, true)] deferred: bool,
+) {
+    let slip = Rc::new(Cell::new(true));
+    let fee_calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "3000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            liquidity_consumption: true,
+            ..Default::default()
+        },
+        FeeModelHandle::new(CashTestFeeModel {
+            calls: fee_calls.clone(),
+            behavior: CashTestFeeBehavior::FixedCharge,
+        }),
+        FillModelHandle::new(InvalidOkFillModel {
+            slip: slip.clone(),
+            step,
+        }),
+        account_type,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Price::from("9200"),
+        Quantity::from("100"),
+        Quantity::from("100"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let initial_balance = cache
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap()
+        .balance(None)
+        .copied();
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    if deferred {
+        let queued = pending.clone();
+        engine.set_event_handler(Rc::new(move |event| queued.borrow_mut().push(event)));
+    }
+    let mut bad = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(side)
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("INVALID-OK-INITIAL"))
+        .build();
+    submit_cash_test_order(&mut bad, account_id);
+    cache
+        .borrow_mut()
+        .add_order(bad.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut bad, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    let bad_events = events.get_messages();
+    assert!(bad_events.iter().any(|event| matches!(event, OrderEventAny::Rejected(rejected) if rejected.client_order_id == bad.client_order_id())), "invalid Ok price needs native rejection: {bad_events:?}");
+    assert!(!bad_events.iter().any(|event| matches!(event, OrderEventAny::Filled(fill) if fill.client_order_id == bad.client_order_id())));
+    assert_eq!(fee_calls.get(), 0);
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&bad.client_order_id())
+            .unwrap()
+            .filled_qty(),
+        Quantity::from("0")
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .balance(None)
+            .copied(),
+        initial_balance
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .events()
+            .len(),
+        1
+    );
+
+    slip.set(false);
+    let mut allowed = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(side)
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("AFTER-INVALID-OK"))
+        .build();
+    submit_cash_test_order(&mut allowed, account_id);
+    cache
+        .borrow_mut()
+        .add_order(allowed.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut allowed, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    let allowed_fills: Vec<_> = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == allowed.client_order_id() => {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(allowed_fills.len(), 1);
+    assert_eq!(allowed_fills[0].last_qty, Quantity::from("100"));
+    assert_eq!(allowed_fills[0].last_px, Price::from("9200"));
+}
+
+#[rstest]
+#[case::cash_buy(AccountType::Cash, OrderSide::Buy, "9201")]
+#[case::margin_buy(AccountType::Margin, OrderSide::Buy, "9201")]
+#[case::margin_sell(AccountType::Margin, OrderSide::Sell, "9199")]
+fn test_market_consumed_source_does_not_sample_fill_model(
+    #[case] account_type: AccountType,
+    #[case] side: OrderSide,
+    #[case] expected_step_price: &str,
+) {
+    fn submit(
+        engine: &mut OrderMatchingEngine,
+        cache: &Rc<RefCell<Cache>>,
+        instrument_id: InstrumentId,
+        account_id: AccountId,
+        side: OrderSide,
+        id: &str,
+    ) -> ClientOrderId {
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument_id)
+            .side(side)
+            .quantity(Quantity::from("100"))
+            .client_order_id(ClientOrderId::from(id))
+            .build();
+        submit_cash_test_order(&mut order, account_id);
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        engine.process_order(&mut order, account_id);
+        order.client_order_id()
+    }
+
+    let calls = Rc::new(Cell::new(0));
+    let next_calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "3000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            liquidity_consumption: true,
+            ..Default::default()
+        },
+        FeeModelHandle::default(),
+        FillModelHandle::new(ScriptedSlipFillModel {
+            calls: calls.clone(),
+            next_calls: next_calls.clone(),
+        }),
+        account_type,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Price::from("9200"),
+        Quantity::from("100"),
+        Quantity::from("100"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let first = submit(
+        &mut engine,
+        &cache,
+        instrument.id(),
+        account_id,
+        side,
+        "SAMPLE-A",
+    );
+    let first_fills: Vec<_> = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == first => Some(fill),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(first_fills.len(), 1);
+    assert_eq!(first_fills[0].last_qty, Quantity::from("100"));
+    assert_eq!(first_fills[0].last_px, Price::from("9200"));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(next_calls.get(), 0);
+
+    let unavailable = submit(
+        &mut engine,
+        &cache,
+        instrument.id(),
+        account_id,
+        side,
+        "SAMPLE-B",
+    );
+    assert!(!events.get_messages().iter().any(
+        |event| matches!(event, OrderEventAny::Filled(fill) if fill.client_order_id == unavailable)
+    ));
+    assert_eq!(calls.get(), 1, "unavailable source advanced slippage model");
+    assert_eq!(next_calls.get(), 0, "unavailable source stepped a price");
+
+    // A changed displayed size refreshes the same native price level.
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Price::from("9200"),
+        Quantity::from("101"),
+        Quantity::from("101"),
+        UnixNanos::from(1u64),
+        UnixNanos::from(1u64),
+    ));
+    let fresh = submit(
+        &mut engine,
+        &cache,
+        instrument.id(),
+        account_id,
+        side,
+        "SAMPLE-C",
+    );
+    let fresh_fills: Vec<_> = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == fresh => Some(fill),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fresh_fills.len(), 1);
+    assert_eq!(fresh_fills[0].last_qty, Quantity::from("100"));
+    assert_eq!(fresh_fills[0].last_px, Price::from(expected_step_price));
+    assert_eq!(calls.get(), 2);
+    assert_eq!(next_calls.get(), 1);
+}
+
+#[rstest]
+#[case::cash_buy_denied(AccountType::Cash, OrderSide::Buy, 10, false)]
+#[case::cash_buy_boundary(AccountType::Cash, OrderSide::Buy, 25, true)]
+#[case::margin_buy_denied(AccountType::Margin, OrderSide::Buy, 10, false)]
+#[case::margin_buy_boundary(AccountType::Margin, OrderSide::Buy, 25, true)]
+#[case::margin_sell_denied(AccountType::Margin, OrderSide::Sell, 10, false)]
+#[case::margin_sell_boundary(AccountType::Margin, OrderSide::Sell, 25, true)]
+fn test_market_post_hook_price_protection_preserves_native_liquidity(
+    #[case] account_type: AccountType,
+    #[case] side: OrderSide,
+    #[case] points: u32,
+    #[case] at_boundary: bool,
+    #[values(false, true)] deferred: bool,
+) {
+    let slip = Rc::new(Cell::new(true));
+    let fee_calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "2000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            liquidity_consumption: true,
+            price_protection_points: Some(points),
+            ..Default::default()
+        },
+        FeeModelHandle::new(CashTestFeeModel {
+            calls: fee_calls.clone(),
+            behavior: CashTestFeeBehavior::Count,
+        }),
+        FillModelHandle::new(ProtectionStepFillModel {
+            slip: slip.clone(),
+            fail_step: None,
+        }),
+        account_type,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Price::from("9200"),
+        Quantity::from("100"),
+        Quantity::from("100"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let original_balance = cache
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap()
+        .balance(None)
+        .copied();
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    if deferred {
+        let pending_events = pending.clone();
+        engine.set_event_handler(Rc::new(move |event| {
+            pending_events.borrow_mut().push(event)
+        }));
+    }
+
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(side)
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("POST-HOOK-PROTECTED"))
+        .build();
+    submit_cash_test_order(&mut order, account_id);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+
+    let fills: Vec<_> = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .collect();
+    let stepped_price = Price::from(if side == OrderSide::Buy {
+        "9225"
+    } else {
+        "9175"
+    });
+    if at_boundary {
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].last_px, stepped_price);
+        assert_eq!(fills[0].last_qty, Quantity::from("100"));
+        assert_eq!(fee_calls.get(), 1);
+    } else {
+        assert!(
+            fills.is_empty(),
+            "post-hook price escaped protection: {fills:?}"
+        );
+        assert_eq!(fee_calls.get(), 0, "denied step reached fee calculation");
+        assert_eq!(
+            cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .filled_qty(),
+            Quantity::from("0")
+        );
+        assert_eq!(
+            cache
+                .borrow()
+                .account_owned(&account_id)
+                .unwrap()
+                .balance(None)
+                .copied(),
+            original_balance,
+            "denied step mutated native account balance"
+        );
+        assert_eq!(
+            cache
+                .borrow()
+                .account_owned(&account_id)
+                .unwrap()
+                .events()
+                .len(),
+            1
+        );
+
+        // The denied source level must remain available to a later admissible order.
+        slip.set(false);
+        let mut allowed = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(side)
+            .quantity(Quantity::from("100"))
+            .client_order_id(ClientOrderId::from("POST-HOOK-ALLOWED"))
+            .build();
+        submit_cash_test_order(&mut allowed, account_id);
+        cache
+            .borrow_mut()
+            .add_order(allowed.clone(), None, None, false)
+            .unwrap();
+        engine.process_order(&mut allowed, account_id);
+        for event in pending.borrow_mut().drain(..) {
+            msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+        }
+        let allowed_fills: Vec<_> = events
+            .get_messages()
+            .into_iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(fill)
+                    if fill.client_order_id == allowed.client_order_id() =>
+                {
+                    Some(fill)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(allowed_fills.len(), 1);
+        assert_eq!(allowed_fills[0].last_px, Price::from("9200"));
+        assert_eq!(allowed_fills[0].last_qty, Quantity::from("100"));
+    }
+}
+
+#[rstest]
+#[case::buy(OrderSide::Buy)]
+#[case::sell(OrderSide::Sell)]
+fn test_market_failed_price_step_preserves_native_liquidity(
+    #[case] side: OrderSide,
+    #[values(false, true)] deferred: bool,
+) {
+    let slip = Rc::new(Cell::new(true));
+    let fail_step = Rc::new(Cell::new(true));
+    let fee_calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "2000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            liquidity_consumption: true,
+            ..Default::default()
+        },
+        FeeModelHandle::new(CashTestFeeModel {
+            calls: fee_calls.clone(),
+            behavior: CashTestFeeBehavior::Count,
+        }),
+        FillModelHandle::new(ProtectionStepFillModel {
+            slip: slip.clone(),
+            fail_step: Some(fail_step.clone()),
+        }),
+        AccountType::Margin,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Price::from("9200"),
+        Quantity::from("100"),
+        Quantity::from("100"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let original_balance = cache
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap()
+        .balance(None)
+        .copied();
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    if deferred {
+        let pending_events = pending.clone();
+        engine.set_event_handler(Rc::new(move |event| {
+            pending_events.borrow_mut().push(event)
+        }));
+    }
+
+    let mut failed = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(side)
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("FAILED-STEP"))
+        .build();
+    submit_cash_test_order(&mut failed, account_id);
+    cache
+        .borrow_mut()
+        .add_order(failed.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut failed, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    let first_events = events.get_messages();
+    assert!(
+        first_events.iter().any(|event| matches!(event, OrderEventAny::Rejected(rejected) if rejected.client_order_id == failed.client_order_id())),
+        "failed initial price step needs native rejection: {first_events:?}"
+    );
+    assert!(
+        !first_events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_)))
+    );
+    assert_eq!(fee_calls.get(), 0);
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&failed.client_order_id())
+            .unwrap()
+            .filled_qty(),
+        Quantity::from("0")
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .balance(None)
+            .copied(),
+        original_balance
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .events()
+            .len(),
+        1
+    );
+
+    // There is no new quote: only preserved native source liquidity can fill this order.
+    fail_step.set(false);
+    slip.set(false);
+    let mut allowed = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(side)
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("AFTER-FAILED-STEP"))
+        .build();
+    submit_cash_test_order(&mut allowed, account_id);
+    cache
+        .borrow_mut()
+        .add_order(allowed.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut allowed, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    let allowed_fills: Vec<_> = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == allowed.client_order_id() => {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(allowed_fills.len(), 1);
+    assert_eq!(allowed_fills[0].last_px, Price::from("9200"));
+    assert_eq!(allowed_fills[0].last_qty, Quantity::from("100"));
+}
+
+#[rstest]
+#[case::fraction(InvalidOkStep::Fraction)]
+#[case::direction(InvalidOkStep::WrongDirection)]
+#[case::sentinel(InvalidOkStep::ErrorSentinel)]
+fn test_invalid_ok_price_step_cash_remainder_rejects_whole_batch(#[case] step: InvalidOkStep) {
+    let fee_calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "3000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            liquidity_consumption: true,
+            ..Default::default()
+        },
+        FeeModelHandle::new(CashTestFeeModel {
+            calls: fee_calls.clone(),
+            behavior: CashTestFeeBehavior::FixedCharge,
+        }),
+        FillModelHandle::new(InvalidOkFillModel {
+            slip: Rc::new(Cell::new(false)),
+            step,
+        }),
+        AccountType::Cash,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Price::from("9200"),
+        Quantity::from("100"),
+        Quantity::from("100"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let original_balance = cache
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap()
+        .balance(None)
+        .copied();
+    let mut bad = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("200"))
+        .client_order_id(ClientOrderId::from("INVALID-CASH-REMAINDER"))
+        .build();
+    submit_cash_test_order(&mut bad, account_id);
+    cache
+        .borrow_mut()
+        .add_order(bad.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut bad, account_id);
+    let messages = events.get_messages();
+    assert!(messages.iter().any(|event| matches!(event, OrderEventAny::Rejected(rejected) if rejected.client_order_id == bad.client_order_id())), "invalid CASH remainder must reject batch: {messages:?}");
+    assert!(!messages.iter().any(|event| matches!(event, OrderEventAny::Filled(fill) if fill.client_order_id == bad.client_order_id())));
+    assert_eq!(fee_calls.get(), 0);
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .balance(None)
+            .copied(),
+        original_balance
+    );
+
+    let mut allowed = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("AFTER-INVALID-CASH-REMAINDER"))
+        .build();
+    submit_cash_test_order(&mut allowed, account_id);
+    cache
+        .borrow_mut()
+        .add_order(allowed.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut allowed, account_id);
+    let allowed_fill = events
+        .get_messages()
+        .into_iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == allowed.client_order_id() => {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .expect("rejected CASH batch must preserve native source");
+    assert_eq!(allowed_fill.last_qty, Quantity::from("100"));
+    assert_eq!(allowed_fill.last_px, Price::from("9200"));
+}
+
+#[rstest]
+#[case::buy_fraction(OrderSide::Buy, InvalidOkStep::Fraction)]
+#[case::buy_direction(OrderSide::Buy, InvalidOkStep::WrongDirection)]
+#[case::buy_sentinel(OrderSide::Buy, InvalidOkStep::ErrorSentinel)]
+#[case::sell_fraction(OrderSide::Sell, InvalidOkStep::Fraction)]
+#[case::sell_direction(OrderSide::Sell, InvalidOkStep::WrongDirection)]
+#[case::sell_sentinel(OrderSide::Sell, InvalidOkStep::ErrorSentinel)]
+fn test_invalid_ok_price_step_market_remainder_keeps_prefix(
+    #[case] side: OrderSide,
+    #[case] step: InvalidOkStep,
+    #[values(false, true)] deferred: bool,
+) {
+    let fee_calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "3000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            liquidity_consumption: true,
+            ..Default::default()
+        },
+        FeeModelHandle::new(CashTestFeeModel {
+            calls: fee_calls.clone(),
+            behavior: CashTestFeeBehavior::FixedCharge,
+        }),
+        FillModelHandle::new(InvalidOkFillModel {
+            slip: Rc::new(Cell::new(false)),
+            step,
+        }),
+        AccountType::Margin,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Price::from("9200"),
+        Quantity::from("100"),
+        Quantity::from("100"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let initial_balance = cache
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap()
+        .balance(None)
+        .copied();
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    if deferred {
+        let queued = pending.clone();
+        engine.set_event_handler(Rc::new(move |event| queued.borrow_mut().push(event)));
+    }
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(side)
+        .quantity(Quantity::from("200"))
+        .client_order_id(ClientOrderId::from("INVALID-OK-REMAINDER"))
+        .build();
+    submit_cash_test_order(&mut order, account_id);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    let messages = events.get_messages();
+    let fills: Vec<_> = messages
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == order.client_order_id() => {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fills.len(),
+        1,
+        "invalid remainder emitted Fill: {messages:?}"
+    );
+    assert_eq!(fills[0].last_px, Price::from("9200"));
+    assert_eq!(fills[0].last_qty, Quantity::from("100"));
+    assert_eq!(fills[0].commission, Some(Money::from("7 IDR")));
+    assert_eq!(fee_calls.get(), 1);
+    assert!(messages.iter().any(|event| matches!(event, OrderEventAny::Canceled(canceled) if canceled.client_order_id == order.client_order_id())), "invalid remainder needs native cancel after Fill: {messages:?}");
+    assert!(!messages.iter().any(|event| matches!(event, OrderEventAny::Rejected(rejected) if rejected.client_order_id == order.client_order_id())));
+    let cached = cache
+        .borrow()
+        .order(&order.client_order_id())
+        .unwrap()
+        .clone();
+    assert_eq!(cached.status(), OrderStatus::Canceled);
+    assert_eq!(cached.filled_qty(), Quantity::from("100"));
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .balance(None)
+            .copied(),
+        initial_balance
+    );
+}
+
+#[rstest]
+#[case::buy(OrderSide::Buy)]
+#[case::sell(OrderSide::Sell)]
+fn test_market_failed_remainder_step_keeps_filled_prefix(
+    #[case] side: OrderSide,
+    #[values(false, true)] deferred: bool,
+) {
+    let slip = Rc::new(Cell::new(false));
+    let fail_step = Rc::new(Cell::new(true));
+    let fee_calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "2000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            liquidity_consumption: true,
+            ..Default::default()
+        },
+        FeeModelHandle::new(CashTestFeeModel {
+            calls: fee_calls.clone(),
+            behavior: CashTestFeeBehavior::FixedCharge,
+        }),
+        FillModelHandle::new(ProtectionStepFillModel {
+            slip: slip.clone(),
+            fail_step: Some(fail_step.clone()),
+        }),
+        AccountType::Margin,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Price::from("9200"),
+        Quantity::from("100"),
+        Quantity::from("100"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let original_balance = cache
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap()
+        .balance(None)
+        .copied();
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    if deferred {
+        let pending_events = pending.clone();
+        engine.set_event_handler(Rc::new(move |event| {
+            pending_events.borrow_mut().push(event)
+        }));
+    }
+
+    let mut partial = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(side)
+        .quantity(Quantity::from("200"))
+        .client_order_id(ClientOrderId::from("FAILED-REMAINDER"))
+        .build();
+    submit_cash_test_order(&mut partial, account_id);
+    cache
+        .borrow_mut()
+        .add_order(partial.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut partial, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    let first_events = events.get_messages();
+    let first_fills: Vec<_> = first_events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == partial.client_order_id() => {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        first_fills.len(),
+        1,
+        "first fill must remain: {first_events:?}"
+    );
+    assert_eq!(first_fills[0].last_qty, Quantity::from("100"));
+    assert_eq!(first_fills[0].last_px, Price::from("9200"));
+    assert_eq!(first_fills[0].commission, Some(Money::from("7 IDR")));
+    assert_eq!(fee_calls.get(), 1);
+    assert!(
+        first_events.iter().any(|event| matches!(event, OrderEventAny::Canceled(canceled) if canceled.client_order_id == partial.client_order_id())),
+        "failed remainder needs native cancellation after Fill: {first_events:?}"
+    );
+    assert!(
+        !first_events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Rejected(_)))
+    );
+    let cached = cache
+        .borrow()
+        .order(&partial.client_order_id())
+        .unwrap()
+        .clone();
+    assert_eq!(cached.status(), OrderStatus::Canceled);
+    assert_eq!(cached.filled_qty(), Quantity::from("100"));
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .balance(None)
+            .copied(),
+        original_balance
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .events()
+            .len(),
+        1
+    );
+
+    fail_step.set(false);
+    let mut consumed_side = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(side)
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("CONSUMED-SOURCE"))
+        .build();
+    submit_cash_test_order(&mut consumed_side, account_id);
+    cache
+        .borrow_mut()
+        .add_order(consumed_side.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut consumed_side, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    assert!(!events.get_messages().iter().any(|event| matches!(event, OrderEventAny::Filled(fill) if fill.client_order_id == consumed_side.client_order_id())));
+
+    let other_side = if side == OrderSide::Buy {
+        OrderSide::Sell
+    } else {
+        OrderSide::Buy
+    };
+    let mut untouched_side = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(other_side)
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("UNTOUCHED-SOURCE"))
+        .build();
+    submit_cash_test_order(&mut untouched_side, account_id);
+    cache
+        .borrow_mut()
+        .add_order(untouched_side.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut untouched_side, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    let other_fills: Vec<_> = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill)
+                if fill.client_order_id == untouched_side.client_order_id() =>
+            {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(other_fills.len(), 1);
+    assert_eq!(other_fills[0].last_qty, Quantity::from("100"));
+    assert_eq!(other_fills[0].last_px, Price::from("9200"));
+}
+
+#[rstest]
+#[case::buy(OrderSide::Buy)]
+#[case::sell(OrderSide::Sell)]
+fn test_limit_failed_price_step_preserves_native_liquidity(
+    #[case] side: OrderSide,
+    #[values(false, true)] deferred: bool,
+) {
+    let slip = Rc::new(Cell::new(true));
+    let fail_step = Rc::new(Cell::new(true));
+    let fee_calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "2000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            liquidity_consumption: true,
+            ..Default::default()
+        },
+        FeeModelHandle::new(CashTestFeeModel {
+            calls: fee_calls.clone(),
+            behavior: CashTestFeeBehavior::Count,
+        }),
+        FillModelHandle::new(ProtectionStepFillModel {
+            slip: slip.clone(),
+            fail_step: Some(fail_step.clone()),
+        }),
+        AccountType::Margin,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Price::from("9200"),
+        Quantity::from("100"),
+        Quantity::from("100"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let original_balance = cache
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap()
+        .balance(None)
+        .copied();
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    if deferred {
+        let pending_events = pending.clone();
+        engine.set_event_handler(Rc::new(move |event| {
+            pending_events.borrow_mut().push(event)
+        }));
+    }
+
+    let mut failed = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(side)
+        .price(Price::from("9200"))
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("LIMIT-FAILED-STEP"))
+        .build();
+    submit_cash_test_order(&mut failed, account_id);
+    cache
+        .borrow_mut()
+        .add_order(failed.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut failed, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    let first_events = events.get_messages();
+    assert!(
+        first_events.iter().any(|event| matches!(event, OrderEventAny::Accepted(accepted) if accepted.client_order_id == failed.client_order_id())),
+        "marketable LIMIT must first be accepted: {first_events:?}"
+    );
+    assert!(
+        first_events.iter().any(|event| matches!(event, OrderEventAny::Rejected(rejected) if rejected.client_order_id == failed.client_order_id())),
+        "accepted LIMIT needs native rejection after initial price-step failure: {first_events:?}"
+    );
+    assert!(
+        !first_events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_)))
+    );
+    assert_eq!(fee_calls.get(), 0);
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&failed.client_order_id())
+            .unwrap()
+            .status(),
+        OrderStatus::Rejected
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .balance(None)
+            .copied(),
+        original_balance
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .events()
+            .len(),
+        1
+    );
+
+    // The original L1 quote remains; a later marketable LIMIT can take its full volume.
+    fail_step.set(false);
+    slip.set(false);
+    let mut allowed = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(side)
+        .price(Price::from("9200"))
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("LIMIT-AFTER-FAILED-STEP"))
+        .build();
+    submit_cash_test_order(&mut allowed, account_id);
+    cache
+        .borrow_mut()
+        .add_order(allowed.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut allowed, account_id);
+    for event in pending.borrow_mut().drain(..) {
+        msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+    }
+    let allowed_fills: Vec<_> = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == allowed.client_order_id() => {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(allowed_fills.len(), 1);
+    assert_eq!(allowed_fills[0].last_px, Price::from("9200"));
+    assert_eq!(allowed_fills[0].last_qty, Quantity::from("100"));
+}
+
 #[derive(Clone, Copy)]
 enum CashTestFeeBehavior {
     Count,
+    FixedCharge,
     FailAfterFirst,
     FutureRebate,
 }
@@ -778,6 +2034,7 @@ impl FeeModel for CashTestFeeModel {
         let first = order.filled_qty().is_zero();
         match self.behavior {
             CashTestFeeBehavior::Count => Ok(Money::from("0 IDR")),
+            CashTestFeeBehavior::FixedCharge => Ok(Money::from("7 IDR")),
             CashTestFeeBehavior::FailAfterFirst if !first => {
                 anyhow::bail!("fixture fee failure on later fill")
             }
@@ -15687,6 +16944,204 @@ fn test_instrument_close_price_used_on_contract_expiration(account_id: AccountId
         .expect("Expected expiration fill at the instrument close price");
     assert_eq!(fill.last_px, close_price);
     let _ = position;
+}
+
+#[rstest]
+fn test_instrument_close_price_step_failure_keeps_expiration_pending(account_id: AccountId) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let events = order_event_handler_with_cache(cache.clone());
+    let activation = UnixNanos::from(
+        u64::try_from(utc_timestamp(2021, 9, 10, 0, 0, 0).as_nanosecond()).unwrap(),
+    );
+    let expiration_ns = UnixNanos::from(
+        u64::try_from(utc_timestamp(2099, 12, 17, 0, 0, 0).as_nanosecond()).unwrap(),
+    );
+    let instrument =
+        InstrumentAny::FuturesContract(futures_contract_es(Some(activation), Some(expiration_ns)));
+    let balance = Money::from("1000000 USD");
+    let account_state = AccountState::new(
+        account_id,
+        AccountType::Margin,
+        vec![AccountBalance::new(
+            balance,
+            Money::zero(balance.currency),
+            balance,
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(balance.currency),
+    );
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::Margin(MarginAccount::new(account_state, true)))
+        .unwrap();
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    clock
+        .borrow_mut()
+        .set_time(UnixNanos::from(activation.as_u64() + 1));
+    let mut engine = OrderMatchingEngine::new(
+        instrument.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::Fixed(FixedFeeModel::new(Money::from("0 USD"), None).unwrap()).into(),
+        BookType::L1_MBP,
+        OmsType::Netting,
+        AccountType::Margin,
+        clock,
+        cache.clone(),
+        OrderMatchingEngineConfig {
+            use_position_ids: true,
+            ..Default::default()
+        },
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("4499.00"),
+        Price::from("4501.00"),
+        Quantity::from(10),
+        Quantity::from(10),
+        UnixNanos::from(activation.as_u64() + 1),
+        UnixNanos::from(activation.as_u64() + 1),
+    ));
+    let mut opening = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .client_order_id(ClientOrderId::from("OPEN-EXPIRY-STEP"))
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(opening.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut opening, account_id);
+    let mut opening_fill = events
+        .get_messages()
+        .into_iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == opening.client_order_id() => {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .expect("native L1 opening fill");
+    assert_eq!(opening_fill.last_px, Price::from("4501.00"));
+    opening_fill.position_id = Some(PositionId::from("P-EXPIRY-STEP"));
+    let position = Position::new(&instrument, opening_fill);
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+    clear_order_event_handler_messages(&events);
+
+    let original_balance = cache
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap()
+        .balance(None)
+        .copied();
+    engine.set_fill_model(FillModelHandle::new(ProtectionStepFillModel {
+        slip: Rc::new(Cell::new(true)),
+        fail_step: Some(Rc::new(Cell::new(true))),
+    }));
+    let close_price = Price::from("4550.00");
+    let close = || {
+        InstrumentClose::new(
+            instrument.id(),
+            close_price,
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        )
+    };
+    engine.process_instrument_close(close());
+    assert!(
+        !engine.is_expiration_processed(),
+        "failed close must remain retryable"
+    );
+    assert!(
+        events.get_messages().iter().all(|event| match event {
+            OrderEventAny::Accepted(accepted) =>
+                !accepted.client_order_id.as_str().starts_with("EXPIRATION-"),
+            OrderEventAny::Filled(fill) =>
+                !fill.client_order_id.as_str().starts_with("EXPIRATION-"),
+            _ => true,
+        }),
+        "failed price step created an orphan expiration order"
+    );
+    assert!(cache.borrow().position(&position.id).unwrap().is_open());
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .balance(None)
+            .copied(),
+        original_balance
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .events()
+            .len(),
+        1
+    );
+
+    engine.set_fill_model(FillModelHandle::new(ProtectionStepFillModel {
+        slip: Rc::new(Cell::new(true)),
+        fail_step: Some(Rc::new(Cell::new(false))),
+    }));
+    engine.process_instrument_close(close());
+    assert!(engine.is_expiration_processed());
+    let settlement_events = events.get_messages();
+    let accepted: Vec<_> = settlement_events
+        .iter()
+        .filter(|event| matches!(event, OrderEventAny::Accepted(accepted) if accepted.client_order_id.as_str().starts_with("EXPIRATION-")))
+        .collect();
+    let fills: Vec<_> = settlement_events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill)
+                if fill.client_order_id.as_str().starts_with("EXPIRATION-") =>
+            {
+                Some(fill)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].order_side, OrderSide::Sell);
+    assert_eq!(fills[0].last_qty, Quantity::from(1));
+    assert_eq!(fills[0].last_px, Price::from("4525.00"));
+    let mut settled_position = position.clone();
+    settled_position.apply(fills[0]);
+    assert!(settled_position.is_closed());
+
+    engine.process_instrument_close(close());
+    let replay_fills = events
+        .get_messages()
+        .iter()
+        .filter(|event| matches!(event, OrderEventAny::Filled(fill) if fill.client_order_id.as_str().starts_with("EXPIRATION-")))
+        .count();
+    assert_eq!(
+        replay_fills, 1,
+        "replayed close duplicated native settlement"
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account_owned(&account_id)
+            .unwrap()
+            .events()
+            .len(),
+        1
+    );
 }
 
 #[rstest]

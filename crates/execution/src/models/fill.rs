@@ -60,6 +60,26 @@ pub trait FillModel {
     /// Returns an error if the model cannot determine whether the order should slip.
     fn is_slipped(&mut self) -> anyhow::Result<bool>;
 
+    /// Returns the next executable price in the order direction.
+    /// Custom models can provide an instrument-specific legal price grid.
+    /// The default preserves the fixed price-increment behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the price cannot be stepped.
+    fn next_price(
+        &self,
+        instrument: &InstrumentAny,
+        price: Price,
+        side: OrderSide,
+    ) -> anyhow::Result<Price> {
+        match side {
+            OrderSide::Buy => price.checked_add(instrument.price_increment()),
+            OrderSide::Sell => price.checked_sub(instrument.price_increment()),
+        }
+        .ok_or_else(|| anyhow::anyhow!("Slipped price overflow"))
+    }
+
     /// Returns whether limit orders at or inside the spread are fillable.
     ///
     /// When true, the matching core treats a limit order as fillable if its
@@ -133,6 +153,15 @@ impl FillModel for FillModelHandle {
 
     fn fill_limit_inside_spread(&self) -> anyhow::Result<bool> {
         self.0.borrow().fill_limit_inside_spread()
+    }
+
+    fn next_price(
+        &self,
+        instrument: &InstrumentAny,
+        price: Price,
+        side: OrderSide,
+    ) -> anyhow::Result<Price> {
+        self.0.borrow().next_price(instrument, price, side)
     }
 
     fn get_orderbook_for_fill_simulation(
@@ -1304,6 +1333,8 @@ pub enum FillModelAny {
     CompetitionAware(CompetitionAwareFillModel),
     VolumeSensitive(VolumeSensitiveFillModel),
     MarketHours(MarketHoursFillModel),
+    /// A Rust fill model supplied to `BacktestVenueConfig` without replacing native matching.
+    Custom(FillModelHandle),
 }
 
 impl FillModel for FillModelAny {
@@ -1320,6 +1351,7 @@ impl FillModel for FillModelAny {
             Self::CompetitionAware(m) => m.is_limit_filled(),
             Self::VolumeSensitive(m) => m.is_limit_filled(),
             Self::MarketHours(m) => m.is_limit_filled(),
+            Self::Custom(m) => m.is_limit_filled(),
         }
     }
 
@@ -1336,6 +1368,7 @@ impl FillModel for FillModelAny {
             Self::CompetitionAware(m) => m.fill_limit_inside_spread(),
             Self::VolumeSensitive(m) => m.fill_limit_inside_spread(),
             Self::MarketHours(m) => m.fill_limit_inside_spread(),
+            Self::Custom(m) => m.fill_limit_inside_spread(),
         }
     }
 
@@ -1352,6 +1385,29 @@ impl FillModel for FillModelAny {
             Self::CompetitionAware(m) => m.is_slipped(),
             Self::VolumeSensitive(m) => m.is_slipped(),
             Self::MarketHours(m) => m.is_slipped(),
+            Self::Custom(m) => m.is_slipped(),
+        }
+    }
+
+    fn next_price(
+        &self,
+        instrument: &InstrumentAny,
+        price: Price,
+        side: OrderSide,
+    ) -> anyhow::Result<Price> {
+        match self {
+            Self::Default(m) => m.next_price(instrument, price, side),
+            Self::BestPrice(m) => m.next_price(instrument, price, side),
+            Self::OneTickSlippage(m) => m.next_price(instrument, price, side),
+            Self::Probabilistic(m) => m.next_price(instrument, price, side),
+            Self::TwoTier(m) => m.next_price(instrument, price, side),
+            Self::ThreeTier(m) => m.next_price(instrument, price, side),
+            Self::LimitOrderPartialFill(m) => m.next_price(instrument, price, side),
+            Self::SizeAware(m) => m.next_price(instrument, price, side),
+            Self::CompetitionAware(m) => m.next_price(instrument, price, side),
+            Self::VolumeSensitive(m) => m.next_price(instrument, price, side),
+            Self::MarketHours(m) => m.next_price(instrument, price, side),
+            Self::Custom(m) => m.next_price(instrument, price, side),
         }
     }
 
@@ -1375,6 +1431,7 @@ impl FillModel for FillModelAny {
             Self::CompetitionAware(m) => m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask),
             Self::VolumeSensitive(m) => m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask),
             Self::MarketHours(m) => m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask),
+            Self::Custom(m) => m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask),
         }
     }
 }
@@ -1399,6 +1456,7 @@ impl Display for FillModelAny {
             Self::CompetitionAware(_) => write!(f, "CompetitionAwareFillModel"),
             Self::VolumeSensitive(_) => write!(f, "VolumeSensitiveFillModel"),
             Self::MarketHours(_) => write!(f, "MarketHoursFillModel"),
+            Self::Custom(_) => write!(f, "CustomFillModel"),
         }
     }
 }
@@ -1760,6 +1818,94 @@ mod tests {
 
         assert_eq!(book.best_bid_price().unwrap(), best_bid - tick);
         assert_eq!(book.best_ask_price().unwrap(), best_ask + tick);
+    }
+
+    struct TieredPriceFillModel;
+
+    impl FillModel for TieredPriceFillModel {
+        fn is_limit_filled(&mut self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn is_slipped(&mut self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn next_price(
+            &self,
+            _instrument: &InstrumentAny,
+            price: Price,
+            side: OrderSide,
+        ) -> anyhow::Result<Price> {
+            let value = price.as_decimal();
+            let step = if value < dec!(5000) {
+                dec!(10)
+            } else if value < dec!(10000) {
+                dec!(25)
+            } else {
+                dec!(50)
+            };
+            let next = match side {
+                OrderSide::Buy => value + step,
+                OrderSide::Sell => {
+                    if value == dec!(5000) {
+                        dec!(4990)
+                    } else if value == dec!(10000) {
+                        dec!(9975)
+                    } else {
+                        value - step
+                    }
+                }
+            };
+            Price::from_decimal_dp(next, price.precision).map_err(Into::into)
+        }
+
+        fn get_orderbook_for_fill_simulation(
+            &mut self,
+            _instrument: &InstrumentAny,
+            _order: &OrderAny,
+            _best_bid: Price,
+            _best_ask: Price,
+        ) -> anyhow::Result<Option<OrderBook>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_default_next_price_keeps_fixed_increment() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let model = FillModelAny::default();
+        let price = Price::from("0.80000");
+        let increment = instrument.price_increment();
+        assert_eq!(
+            model.next_price(&instrument, price, OrderSide::Buy).unwrap(),
+            price.checked_add(increment).unwrap()
+        );
+        assert_eq!(
+            model.next_price(&instrument, price, OrderSide::Sell).unwrap(),
+            price.checked_sub(increment).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_custom_next_price_delegates_through_any_and_handle() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let model = FillModelAny::Custom(FillModelHandle::new(TieredPriceFillModel));
+        let handle: FillModelHandle = model.clone().into();
+        for (price, buy, sell) in [
+            ("5000", "5025", "4990"),
+            ("9200", "9225", "9175"),
+        ] {
+            let price = Price::from(price);
+            assert_eq!(
+                model.next_price(&instrument, price, OrderSide::Buy).unwrap(),
+                Price::from(buy)
+            );
+            assert_eq!(
+                handle.next_price(&instrument, price, OrderSide::Sell).unwrap(),
+                Price::from(sell)
+            );
+        }
     }
 
     #[rstest]

@@ -22,14 +22,7 @@ pub mod inflight;
 
 mod settlement;
 
-use std::{
-    cell::RefCell,
-    cmp::min,
-    fmt::Debug,
-    mem,
-    ops::{Add, Sub},
-    rc::Rc,
-};
+use std::{cell::RefCell, cmp::min, fmt::Debug, mem, ops::Add, rc::Rc};
 
 use indexmap::{IndexMap, IndexSet};
 use jiff::SignedDuration;
@@ -68,8 +61,8 @@ use nautilus_model::{
     orders::{MarketOrder, Order, OrderAny, OrderCore},
     position::{Position, PositionReplayEvent},
     types::{
-        Currency, Money, Price, Quantity, fixed::FIXED_PRECISION, price::PriceRaw,
-        quantity::QuantityRaw,
+        Currency, Money, PRICE_ERROR, PRICE_RAW_MAX, PRICE_RAW_MIN, PRICE_UNDEF, Price, Quantity,
+        fixed::FIXED_PRECISION, price::PriceRaw, quantity::QuantityRaw,
     },
 };
 use rust_decimal::Decimal;
@@ -1536,6 +1529,36 @@ impl OrderMatchingEngine {
         ))
     }
 
+    fn checked_fill_model_next_price(
+        &self,
+        source: Price,
+        side: OrderSide,
+    ) -> anyhow::Result<Price> {
+        let stepped = self.fill_model.next_price(&self.instrument, source, side)?;
+        let raw = stepped.raw();
+        if matches!(raw, PRICE_UNDEF | PRICE_ERROR)
+            || raw < PRICE_RAW_MIN
+            || raw > PRICE_RAW_MAX
+            || stepped.precision > FIXED_PRECISION
+        {
+            anyhow::bail!(
+                "Invalid fill-model price raw={raw} precision={}",
+                stepped.precision
+            );
+        }
+        let stepped = self
+            .normalize_price_for_current_instrument(stepped)
+            .ok_or_else(|| anyhow::anyhow!("Fill-model price is off the instrument grid"))?;
+        let moves_outward = match side {
+            OrderSide::Buy => stepped > source,
+            OrderSide::Sell => stepped < source,
+        };
+        if !moves_outward {
+            anyhow::bail!("Fill-model price did not move in the {side} direction");
+        }
+        Ok(stepped)
+    }
+
     fn normalize_quantity_for_current_instrument(&self, quantity: Quantity) -> Option<Quantity> {
         let precision = self.instrument.size_precision();
         if !Self::quantity_matches_precision(quantity, precision) {
@@ -2660,12 +2683,6 @@ impl OrderMatchingEngine {
             return;
         }
 
-        self.expiration_processed = true;
-        self.pending_resolution = false;
-        let close = self.instrument_close.take();
-        log::info!("{} reached expiration", self.instrument.id());
-        self.cancel_open_orders_for_expiration();
-
         let instrument_id = self.instrument.id();
         let positions: Vec<(
             TraderId,
@@ -2694,10 +2711,54 @@ impl OrderMatchingEngine {
                 .collect()
         };
 
-        let ts_now = self.clock.borrow().timestamp_ns();
-        let close_price = close.as_ref().map(|close| close.close_price);
+        // A close price is a synthetic fill source. Price every position before
+        // accepting any close order, so a later hook failure cannot strand an
+        // earlier settlement fill or consume the close needed for retry.
+        let prepared_close_prices = if let Some(close_price) = self
+            .instrument_close
+            .as_ref()
+            .map(|close| close.close_price)
+        {
+            let prepared = (|| -> anyhow::Result<Vec<Price>> {
+                let mut prices = Vec::with_capacity(positions.len());
+                for (_, _, _, _, closing_side, _) in &positions {
+                    let mut price = self
+                        .normalize_price_for_current_instrument(close_price)
+                        .ok_or_else(|| anyhow::anyhow!("Unsupported expiration close price"))?;
+                    if self.book_type == BookType::L1_MBP && self.fill_model.is_slipped()? {
+                        price = self.checked_fill_model_next_price(price, *closing_side)?;
+                    }
+                    price = self
+                        .normalize_price_for_current_instrument(price)
+                        .ok_or_else(|| anyhow::anyhow!("Unsupported stepped expiration price"))?;
+                    prices.push(price);
+                }
+                Ok(prices)
+            })();
+            match prepared {
+                Ok(prices) => Some(prices),
+                Err(e) => {
+                    log::error!(
+                        "Expiration close price preparation failed for {instrument_id}: {e}"
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
-        for (trader_id, strategy_id, account_id, position_id, closing_side, quantity) in positions {
+        self.expiration_processed = true;
+        self.pending_resolution = false;
+        let _ = self.instrument_close.take();
+        log::info!("{} reached expiration", self.instrument.id());
+        self.cancel_open_orders_for_expiration();
+
+        let ts_now = self.clock.borrow().timestamp_ns();
+
+        for (index, (trader_id, strategy_id, account_id, position_id, closing_side, quantity)) in
+            positions.into_iter().enumerate()
+        {
             let client_order_id =
                 ClientOrderId::from(format!("EXPIRATION-{}-{}", self.venue, UUID4::new()).as_str());
             let mut order = OrderAny::Market(MarketOrder::new(
@@ -2743,7 +2804,7 @@ impl OrderMatchingEngine {
             self.account_ids.insert(trader_id, account_id);
             self.generate_order_accepted(&order, venue_order_id);
 
-            if let Some(fill_price) = close_price {
+            if let Some(fill_price) = prepared_close_prices.as_ref().map(|prices| prices[index]) {
                 if let Err(e) = self.apply_fills(
                     &order,
                     &[(fill_price, quantity)],
@@ -2751,6 +2812,7 @@ impl OrderMatchingEngine {
                     Some(position_id),
                     None,
                     None,
+                    true,
                 ) {
                     log::error!("Cannot fill expiration order {client_order_id}: {e}");
                 }
@@ -4305,7 +4367,10 @@ impl OrderMatchingEngine {
         }
     }
 
-    fn determine_limit_price_and_volume(&mut self, order: &OrderAny) -> Vec<(Price, Quantity)> {
+    fn determine_limit_price_and_volume(
+        &mut self,
+        order: &OrderAny,
+    ) -> (Vec<(Price, Quantity)>, Option<Vec<Price>>, QuantityRaw) {
         match order.price() {
             Some(order_price) => {
                 // When liquidity consumption is enabled, get ALL crossed levels so that
@@ -4353,38 +4418,35 @@ impl OrderMatchingEngine {
                                 fills.len()
                             );
 
-                            if self.config.liquidity_consumption {
-                                self.trade_consumption += fill_qty.raw();
-                            }
-
                             // Fill at the limit price (conservative) rather than the trade price.
                             // Trade execution fills already account for consumption via trade_consumption,
                             // return early to bypass apply_liquidity_consumption which would incorrectly
                             // discard these fills when the trade price isn't in the order book.
-                            return vec![(order_price, fill_qty)];
+                            return (
+                                vec![(order_price, fill_qty)],
+                                None,
+                                if self.config.liquidity_consumption {
+                                    fill_qty.raw()
+                                } else {
+                                    0
+                                },
+                            );
                         }
                     }
                 }
 
                 // Return immediately if no fills
                 if fills.is_empty() {
-                    return fills;
+                    return (fills, None, 0);
                 }
 
                 // Save original book prices BEFORE any fill price modifications for consumption tracking,
                 // since the MAKER loop below may adjust fill prices. Consumption should be
                 // tracked against the original book price levels where liquidity was sourced from.
-                let book_prices: Vec<Price> = if self.config.liquidity_consumption {
-                    fills.iter().map(|(px, _)| *px).collect()
-                } else {
-                    Vec::new()
-                };
-
-                let book_prices_ref: Option<&[Price]> = if book_prices.is_empty() {
-                    None
-                } else {
-                    Some(&book_prices)
-                };
+                let book_prices = self
+                    .config
+                    .liquidity_consumption
+                    .then(|| fills.iter().map(|(px, _)| *px).collect());
 
                 // Filling as MAKER from trigger
                 if order
@@ -4441,12 +4503,7 @@ impl OrderMatchingEngine {
                     }
                 }
 
-                self.apply_liquidity_consumption(
-                    fills,
-                    order.order_side(),
-                    order.leaves_qty(),
-                    book_prices_ref,
-                )
+                (fills, book_prices, 0)
             }
             None => panic!("Limit order must have a price"),
         }
@@ -4535,7 +4592,7 @@ impl OrderMatchingEngine {
     fn determine_limit_fill_model_price_and_volume(
         &mut self,
         order: &OrderAny,
-    ) -> anyhow::Result<Vec<(Price, Quantity)>> {
+    ) -> anyhow::Result<(Vec<(Price, Quantity)>, Option<Vec<Price>>, QuantityRaw)> {
         if let (Some(best_bid), Some(best_ask)) = (self.core.bid, self.core.ask)
             && let Some(book) = self.fill_model.get_orderbook_for_fill_simulation(
                 &self.instrument,
@@ -4548,7 +4605,7 @@ impl OrderMatchingEngine {
             let book_order = BookOrder::new(order.order_side(), limit_price, order.quantity(), 0);
             let fills = book.simulate_fills(&book_order);
             if !fills.is_empty() {
-                return Ok(fills);
+                return Ok((fills, None, 0));
             }
         }
         Ok(self.determine_limit_price_and_volume(order))
@@ -4681,8 +4738,7 @@ impl OrderMatchingEngine {
             fills = self.filter_fills_by_protection(fills, &order, protection_price);
         }
 
-        // Skip consumption for synthetic fill-model books (prices may not exist
-        // in the real book) and trigger price fills (gap price may not exist)
+        // Synthetic books and trigger gap prices do not consume native source levels.
         let is_trigger_price_fill = !self.fill_at_market
             && self.book_type == BookType::L1_MBP
             && matches!(
@@ -4690,6 +4746,106 @@ impl OrderMatchingEngine {
                 OrderType::StopMarket | OrderType::TrailingStopMarket | OrderType::MarketIfTouched
             )
             && order.trigger_price().is_some();
+
+        // The fill model can fail or step a legal source price beyond protection.
+        // Resolve it once before committing source liquidity or planning CASH debit.
+        let prices_prepared = cash_available.is_some() || self.book_type == BookType::L1_MBP;
+        let mut book_prices = Vec::new();
+        if prices_prepared {
+            let mut preview_consumption =
+                (self.config.liquidity_consumption && !from_synthetic && !is_trigger_price_fill)
+                    .then(|| match order.order_side() {
+                        OrderSide::Buy => self.ask_consumption.clone(),
+                        OrderSide::Sell => self.bid_consumption.clone(),
+                    });
+            let mut remaining_source_qty = order.leaves_qty();
+            let mut protected_fills = Vec::with_capacity(fills.len());
+            for (source_price, mut quantity) in fills {
+                let mut candidate_consumption = preview_consumption.clone();
+                if let Some(consumption) = candidate_consumption.as_mut() {
+                    if remaining_source_qty.is_zero() {
+                        break;
+                    }
+                    let available = Self::consume_book_liquidity(
+                        &self.book,
+                        consumption,
+                        vec![(source_price, quantity)],
+                        order.order_side(),
+                        remaining_source_qty,
+                        None,
+                    );
+                    let Some((_, available_quantity)) = available.into_iter().next() else {
+                        continue;
+                    };
+                    quantity = available_quantity;
+                }
+                let Some(mut executable_price) =
+                    self.normalize_fill_price(source_price, order.client_order_id())
+                else {
+                    if cash_available.is_some() {
+                        self.reject_or_hold_cash_market_batch(
+                            &order,
+                            &anyhow::anyhow!("Unsupported fill price"),
+                        );
+                        return;
+                    }
+                    continue;
+                };
+                let Some(quantity) =
+                    self.normalize_fill_quantity(quantity, order.client_order_id())
+                else {
+                    if cash_available.is_some() {
+                        self.reject_or_hold_cash_market_batch(
+                            &order,
+                            &anyhow::anyhow!("Unsupported fill quantity"),
+                        );
+                        return;
+                    }
+                    continue;
+                };
+                if !quantity.is_zero() {
+                    let slipped = match self.fill_model.is_slipped() {
+                        Ok(slipped) => slipped,
+                        Err(e) => {
+                            if cash_available.is_some() {
+                                self.reject_or_hold_cash_market_batch(&order, &e);
+                            } else {
+                                self.reject_or_cancel_price_failure(&order, &e, "MARKET");
+                            }
+                            return;
+                        }
+                    };
+                    if slipped {
+                        executable_price = match self
+                            .checked_fill_model_next_price(executable_price, order.order_side())
+                        {
+                            Ok(price) => price,
+                            Err(e) => {
+                                if cash_available.is_some() {
+                                    self.reject_or_hold_cash_market_batch(&order, &e);
+                                } else {
+                                    self.reject_or_cancel_price_failure(&order, &e, "MARKET");
+                                }
+                                return;
+                            }
+                        };
+                    }
+                }
+                let inside = protection_price.is_none_or(|boundary| match order.order_side() {
+                    OrderSide::Buy => executable_price <= boundary,
+                    OrderSide::Sell => executable_price >= boundary,
+                });
+                if inside {
+                    if candidate_consumption.is_some() {
+                        preview_consumption = candidate_consumption;
+                        remaining_source_qty = remaining_source_qty.saturating_sub(quantity);
+                    }
+                    book_prices.push(source_price);
+                    protected_fills.push((executable_price, quantity));
+                }
+            }
+            fills = protected_fills;
+        }
 
         if let Some(available) = cash_available {
             let mut consumption = self.ask_consumption.clone();
@@ -4700,17 +4856,22 @@ impl OrderMatchingEngine {
                     fills,
                     OrderSide::Buy,
                     order.leaves_qty(),
-                    None,
+                    prices_prepared.then_some(book_prices.as_slice()),
                 );
             }
-            let plan =
-                match self.plan_cash_market_batch(&order, &fills, protection_price, available) {
-                    Ok(plan) => plan,
-                    Err(e) => {
-                        self.reject_or_hold_cash_market_batch(&order, &e);
-                        return;
-                    }
-                };
+            let plan = match self.plan_cash_market_batch(
+                &order,
+                &fills,
+                protection_price,
+                available,
+                prices_prepared,
+            ) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    self.reject_or_hold_cash_market_batch(&order, &e);
+                    return;
+                }
+            };
             self.ask_consumption = consumption;
             for (price, quantity, commission) in plan {
                 if let Err(e) = self.fill_order_with_commission(
@@ -4749,7 +4910,7 @@ impl OrderMatchingEngine {
                 fills,
                 order.order_side(),
                 order.leaves_qty(),
-                None,
+                prices_prepared.then_some(book_prices.as_slice()),
             );
         }
 
@@ -4764,6 +4925,7 @@ impl OrderMatchingEngine {
             },
             position.as_ref(),
             protection_price,
+            prices_prepared,
         ) {
             log::error!("Cannot fill market order {}: {e}", order.client_order_id());
         }
@@ -4944,12 +5106,37 @@ impl OrderMatchingEngine {
         self.generate_order_rejected(order, format!("CASH_BATCH: {e}").into());
     }
 
+    fn reject_or_cancel_price_failure(
+        &mut self,
+        order: &OrderAny,
+        e: &anyhow::Error,
+        context: &str,
+    ) {
+        let filled_qty = self
+            .cached_filled_qty
+            .get(&order.client_order_id())
+            .copied()
+            .unwrap_or_else(|| order.filled_qty())
+            .max(order.filled_qty());
+        if filled_qty.is_zero() {
+            self.purge_stale_core_entry(order.client_order_id());
+            self.generate_order_rejected(order, format!("{context}_PRICE: {e}").into());
+        } else {
+            log::warn!(
+                "Canceling partially filled {context} order {} after price failure: {e}",
+                order.client_order_id()
+            );
+            self.cancel_order(order, None);
+        }
+    }
+
     fn plan_cash_market_batch(
         &mut self,
         order: &OrderAny,
         fills: &[(Price, Quantity)],
         protection_price: Option<Price>,
         available: Money,
+        prices_prepared: bool,
     ) -> anyhow::Result<Vec<(Price, Quantity, Money)>> {
         let mut prices_and_quantities = Vec::with_capacity(fills.len() + 1);
         let mut total_filled = order.filled_qty();
@@ -4963,10 +5150,8 @@ impl OrderMatchingEngine {
             if quantity.is_zero() {
                 anyhow::bail!("Zero market fill quantity");
             }
-            if self.fill_model.is_slipped()? {
-                price = price
-                    .checked_add(self.instrument.price_increment())
-                    .ok_or_else(|| anyhow::anyhow!("Slipped price overflow"))?;
+            if !prices_prepared && self.fill_model.is_slipped()? {
+                price = self.checked_fill_model_next_price(price, OrderSide::Buy)?;
             }
             let quantity = min(quantity, order.quantity().saturating_sub(total_filled));
             if quantity.is_zero() {
@@ -4980,9 +5165,7 @@ impl OrderMatchingEngine {
         if total_filled < order.quantity()
             && let Some((last_price, _)) = prices_and_quantities.last()
         {
-            let price = last_price
-                .checked_add(self.instrument.price_increment())
-                .ok_or_else(|| anyhow::anyhow!("L1 remainder price overflow"))?;
+            let price = self.checked_fill_model_next_price(*last_price, OrderSide::Buy)?;
             if protection_price.is_none_or(|boundary| price <= boundary) {
                 prices_and_quantities.push((price, order.quantity().saturating_sub(total_filled)));
             }
@@ -5155,16 +5338,111 @@ impl OrderMatchingEngine {
                 }
 
                 let tc_before = self.trade_consumption;
-                let mut fills = match self.determine_limit_fill_model_price_and_volume(&order) {
-                    Ok(fills) => fills,
-                    Err(e) => {
-                        log::error!(
-                            "Cannot fill limit order {}: fill model failed: {e}",
-                            order.client_order_id()
-                        );
-                        return;
+                let (mut fills, book_prices, trade_consumed) =
+                    match self.determine_limit_fill_model_price_and_volume(&order) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::error!(
+                                "Cannot fill limit order {}: fill model failed: {e}",
+                                order.client_order_id()
+                            );
+                            return;
+                        }
+                    };
+
+                // Stage native source consumption until every fallible L1 price step succeeds.
+                let mut staged_ask = None;
+                let mut staged_bid = None;
+                if let Some(book_prices) = book_prices {
+                    match order.order_side() {
+                        OrderSide::Buy => {
+                            let mut consumption = self.ask_consumption.clone();
+                            fills = Self::consume_book_liquidity(
+                                &self.book,
+                                &mut consumption,
+                                fills,
+                                OrderSide::Buy,
+                                order.leaves_qty(),
+                                Some(&book_prices),
+                            );
+                            staged_ask = Some(consumption);
+                        }
+                        OrderSide::Sell => {
+                            let mut consumption = self.bid_consumption.clone();
+                            fills = Self::consume_book_liquidity(
+                                &self.book,
+                                &mut consumption,
+                                fills,
+                                OrderSide::Sell,
+                                order.leaves_qty(),
+                                Some(&book_prices),
+                            );
+                            staged_bid = Some(consumption);
+                        }
                     }
-                };
+                }
+
+                let prices_prepared = self.book_type == BookType::L1_MBP;
+                if prices_prepared {
+                    let mut prepared = Vec::with_capacity(fills.len());
+                    for (source_price, quantity) in fills {
+                        let Some(mut executable_price) =
+                            self.normalize_fill_price(source_price, order.client_order_id())
+                        else {
+                            self.reject_or_cancel_price_failure(
+                                &order,
+                                &anyhow::anyhow!("Unsupported fill price"),
+                                "LIMIT",
+                            );
+                            return;
+                        };
+                        let Some(quantity) =
+                            self.normalize_fill_quantity(quantity, order.client_order_id())
+                        else {
+                            self.reject_or_cancel_price_failure(
+                                &order,
+                                &anyhow::anyhow!("Unsupported fill quantity"),
+                                "LIMIT",
+                            );
+                            return;
+                        };
+                        let price_result = match self.fill_model.is_slipped() {
+                            Ok(true) => self.checked_fill_model_next_price(
+                                executable_price,
+                                order.order_side(),
+                            ),
+                            Ok(false) => Ok(executable_price),
+                            Err(e) => Err(e),
+                        };
+                        executable_price = match price_result {
+                            Ok(price) => price,
+                            Err(e) => {
+                                self.reject_or_cancel_price_failure(&order, &e, "LIMIT");
+                                return;
+                            }
+                        };
+                        if self
+                            .normalize_fill_price(executable_price, order.client_order_id())
+                            .is_none()
+                        {
+                            self.reject_or_cancel_price_failure(
+                                &order,
+                                &anyhow::anyhow!("Unsupported stepped fill price"),
+                                "LIMIT",
+                            );
+                            return;
+                        }
+                        prepared.push((executable_price, quantity));
+                    }
+                    fills = prepared;
+                }
+                if let Some(consumption) = staged_ask {
+                    self.ask_consumption = consumption;
+                }
+                if let Some(consumption) = staged_bid {
+                    self.bid_consumption = consumption;
+                }
+                self.trade_consumption += trade_consumed;
 
                 if let Some(allowed_raw) = queue_allowed_raw {
                     let size_prec = self.instrument.size_precision();
@@ -5215,6 +5493,7 @@ impl OrderMatchingEngine {
                     venue_position_id,
                     position.as_ref(),
                     None,
+                    prices_prepared,
                 ) {
                     log::error!("Cannot fill limit order {}: {e}", order.client_order_id());
                 }
@@ -5303,6 +5582,7 @@ impl OrderMatchingEngine {
         venue_position_id: Option<PositionId>,
         position: Option<&Position>,
         protection_price: Option<Price>,
+        prices_prepared: bool,
     ) -> anyhow::Result<()> {
         if order.time_in_force() == TimeInForce::Fok {
             let mut total_size = Quantity::zero(order.quantity().precision);
@@ -5387,11 +5667,11 @@ impl OrderMatchingEngine {
                 initial_market_to_limit_fill = true;
             }
 
-            if self.book_type == BookType::L1_MBP && self.fill_model.is_slipped()? {
-                fill_px = match order.order_side() {
-                    OrderSide::Buy => fill_px.add(self.instrument.price_increment()),
-                    OrderSide::Sell => fill_px.sub(self.instrument.price_increment()),
-                }
+            if !prices_prepared
+                && self.book_type == BookType::L1_MBP
+                && self.fill_model.is_slipped()?
+            {
+                fill_px = self.checked_fill_model_next_price(fill_px, order.order_side())?;
             }
 
             let mut effective_fill_qty = fill_qty;
@@ -5498,9 +5778,12 @@ impl OrderMatchingEngine {
             };
 
             let side = order.order_side();
-            let slip_fill_px = match side {
-                OrderSide::Buy => last_fill_px.add(self.instrument.price_increment()),
-                OrderSide::Sell => last_fill_px.sub(self.instrument.price_increment()),
+            let slip_fill_px = match self.checked_fill_model_next_price(last_fill_px, side) {
+                Ok(price) => price,
+                Err(e) => {
+                    self.reject_or_cancel_price_failure(order, &e, "MARKET_REMAINDER");
+                    return Ok(());
+                }
             };
 
             if let Some(protection_price) = protection_price {
@@ -8148,6 +8431,7 @@ mod tests {
                     Some(position_id),
                     Some(&position),
                     None,
+                    false,
                 )
                 .unwrap();
             let events = events.borrow();
@@ -8392,6 +8676,7 @@ mod tests {
                 Some(position_id),
                 Some(&position),
                 None,
+                false,
             )
             .unwrap();
 
@@ -8646,6 +8931,7 @@ mod tests {
                     Some(position_id),
                     Some(&position),
                     None,
+                    false,
                 )
                 .unwrap();
             let mut expected = vec![("fill", "MIXED-CLOSE", Quantity::from(quantity))];
@@ -9060,6 +9346,7 @@ mod tests {
                 Some(position_id),
                 Some(&position),
                 None,
+                false,
             )
             .unwrap();
         let ids = engine.reduce_only_order_ids(position_id);
@@ -9704,6 +9991,7 @@ mod tests {
                 Some(position_id),
                 Some(&position),
                 None,
+                false,
             )
             .unwrap();
 
