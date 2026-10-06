@@ -24,8 +24,9 @@ venue = BacktestVenueConfig(
 
 When trade execution is disabled, behavior depends on the venue's book type:
 
-- With L1 data, accepted trade ticks update the L1 book but skip matching and maintenance. Later
-  quote ticks or executable bars drive that work.
+- With L1 data, accepted trade ticks advance the last price but leave the L1 book unchanged, so
+  quotes remain the book source, as in the sandbox. Trade ticks, including stale ones, skip
+  matching and maintenance. Later quote ticks or executable bars drive that work.
 - With L2 or L3 data, accepted trade ticks advance `LastPrice` and run trailing-stop maintenance
   for all trigger types. They can trigger `LastPrice` stop orders, which fill against existing book
   liquidity. The tick does not match resting limits or trigger stop orders that use other trigger

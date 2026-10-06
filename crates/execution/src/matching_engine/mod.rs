@@ -2302,9 +2302,11 @@ impl OrderMatchingEngine {
 
     /// Processes a trade tick to update the market state.
     ///
-    /// For accepted L1 ticks, updates the order book to maintain market state. When
-    /// `trade_execution` is disabled, the L1 path syncs matching prices from the book and
-    /// returns; a later quote tick or executable bar drives matching and maintenance.
+    /// For accepted L1 ticks with `trade_execution` enabled, updates the order book to
+    /// maintain market state. When `trade_execution` is disabled, L1 ticks leave the book to
+    /// quotes, as the sandbox does, and never run matching, including stale ticks. An accepted
+    /// tick advances the last price, syncs matching prices from the book and returns; a later
+    /// quote tick or executable bar drives matching and maintenance.
     /// Accepted L2/L3 ticks still advance `LastPrice` and run trailing-stop maintenance
     /// for all trigger types, enabled GTD expiry, and instrument-expiration checks. They
     /// can trigger `LastPrice` stop orders, which fill against book liquidity. The trade
@@ -2336,11 +2338,14 @@ impl OrderMatchingEngine {
                     self.book.ts_last,
                     self.book.instrument_id,
                 );
-                self.iterate(trade.ts_init, AggressorSide::NoAggressor);
+                if self.config.trade_execution {
+                    self.iterate(trade.ts_init, AggressorSide::NoAggressor);
+                }
                 return;
             }
 
-            if !self.update_trade_tick_or_skip(trade, "trade tick") {
+            // Quotes remain the book source unless trades drive execution
+            if self.config.trade_execution && !self.update_trade_tick_or_skip(trade, "trade tick") {
                 return;
             }
         }

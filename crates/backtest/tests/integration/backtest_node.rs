@@ -1856,3 +1856,182 @@ fn test_backtest_node_custom_static_grid_applies_native_fee_and_cash() {
     assert_eq!(first.position_quantity, Quantity::from("100"));
     assert_eq!(first.portfolio_position, Decimal::from_str("100").unwrap());
 }
+
+struct MarketOnTradeStrategy {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    submitted: bool,
+    fills: Rc<RefCell<Vec<OrderFilled>>>,
+}
+
+impl MarketOnTradeStrategy {
+    fn new(instrument_id: InstrumentId, fills: Rc<RefCell<Vec<OrderFilled>>>) -> Self {
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("MARKET-ON-TRADE-001")),
+            order_id_tag: Some("001".to_string()),
+            ..Default::default()
+        };
+        Self {
+            core: StrategyCore::new(config),
+            instrument_id,
+            submitted: false,
+            fills,
+        }
+    }
+}
+
+nautilus_strategy!(MarketOnTradeStrategy, {
+    fn on_order_filled(&mut self, event: &OrderFilled) {
+        self.fills.borrow_mut().push(event.clone());
+    }
+});
+
+impl Debug for MarketOnTradeStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(MarketOnTradeStrategy)).finish()
+    }
+}
+
+impl DataActor for MarketOnTradeStrategy {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_trades(self.instrument_id, None, None);
+        Ok(())
+    }
+
+    fn on_trade(&mut self, _trade: &TradeTick) -> anyhow::Result<()> {
+        if self.submitted {
+            return Ok(());
+        }
+        self.submitted = true;
+        let order = self.order().market(
+            self.instrument_id,
+            OrderSide::Buy,
+            Quantity::from("1000"),
+            Some(TimeInForce::Gtc),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        self.submit_order(order, None, None, None)
+    }
+}
+
+#[rstest]
+#[case::quote_book_kept(false, vec![("1000", "9200")])]
+#[case::trade_resets_top_size(true, vec![("100", "9200"), ("900", "9201")])]
+fn test_backtest_node_l1_trade_tick_book_source_follows_trade_execution(
+    #[case] trade_execution: bool,
+    #[case] expected: Vec<(&str, &str)>,
+) {
+    Currency::register(
+        Currency::new("IDR", 2, 360, "Indonesian rupiah", CurrencyType::Fiat),
+        false,
+    )
+    .unwrap();
+    let idr = Currency::from("IDR");
+    let instrument = InstrumentAny::Equity(
+        Equity::builder()
+            .instrument_id(InstrumentId::from("BBCA.XIDX"))
+            .raw_symbol(Symbol::from("BBCA"))
+            .currency(idr)
+            .price_precision(0)
+            .price_increment(Price::from("1"))
+            .lot_size(Quantity::from("100"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap(),
+    );
+    let temp_dir = TempDir::new().unwrap();
+    let catalog_path = temp_dir.path().to_str().unwrap();
+    let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+    catalog.write_instruments(vec![instrument.clone()]).unwrap();
+    let quotes = [
+        QuoteTick::new(
+            instrument.id(),
+            Price::from("9175"),
+            Price::from("9200"),
+            Quantity::from("1000000"),
+            Quantity::from("1000000"),
+            UnixNanos::from(1_000_000_000u64),
+            UnixNanos::from(1_000_000_000u64),
+        ),
+        QuoteTick::new(
+            instrument.id(),
+            Price::from("9175"),
+            Price::from("9200"),
+            Quantity::from("1000000"),
+            Quantity::from("1000000"),
+            UnixNanos::from(3_000_000_000u64),
+            UnixNanos::from(3_000_000_000u64),
+        ),
+    ];
+    let trades = [TradeTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Quantity::from("100"),
+        AggressorSide::Buy,
+        TradeId::from("T1"),
+        UnixNanos::from(2_000_000_000u64),
+        UnixNanos::from(2_000_000_000u64),
+    )];
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&trades, None, None, None).unwrap();
+
+    let venue = BacktestVenueConfig::builder()
+        .name(Ustr::from("XIDX"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Cash)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec!["1000000000 IDR".to_string()])
+        .base_currency(idr)
+        .trade_execution(trade_execution)
+        .build()
+        .unwrap();
+    let trade_data = BacktestDataConfig::builder()
+        .data_type(NautilusDataType::TradeTick)
+        .catalog_path(catalog_path.to_string())
+        .instrument_id(instrument.id())
+        .build()
+        .unwrap();
+    let config = BacktestRunConfig::builder()
+        .venues(vec![venue])
+        .data(vec![data_config(catalog_path, instrument.id()), trade_data])
+        .dispose_on_completion(false)
+        .build()
+        .unwrap();
+    let config_id = config.id().to_string();
+    let fills = Rc::new(RefCell::new(Vec::new()));
+    let mut node = BacktestNode::new(vec![config]).unwrap();
+    node.build().unwrap();
+    node.get_engine_mut(&config_id)
+        .unwrap()
+        .add_strategy(MarketOnTradeStrategy::new(instrument.id(), fills.clone()))
+        .unwrap();
+    let results = node.run().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].iterations, 3);
+    assert_eq!(results[0].total_orders, 1);
+
+    let fills = fills
+        .borrow()
+        .iter()
+        .map(|fill| (fill.last_qty, fill.last_px))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fills,
+        expected
+            .iter()
+            .map(|(quantity, price)| (Quantity::from(*quantity), Price::from(*price)))
+            .collect::<Vec<_>>()
+    );
+    let engine = node.get_engine(&config_id).unwrap();
+    let cache = engine.kernel().cache.borrow();
+    let orders = cache.orders(None, Some(&instrument.id()), None, None, None);
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].status(), OrderStatus::Filled);
+    assert_eq!(orders[0].filled_qty(), Quantity::from("1000"));
+}

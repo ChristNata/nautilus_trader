@@ -2009,6 +2009,218 @@ fn test_limit_failed_price_step_preserves_native_liquidity(
     assert_eq!(allowed_fills[0].last_qty, Quantity::from("100"));
 }
 
+#[rstest]
+#[case::quote_book_kept(false, "1000000", vec![("1000", "9200")])]
+#[case::trade_resets_top_size(true, "1000000", vec![("100", "9200"), ("900", "9225")])]
+#[case::displayed_size_still_steps(false, "300", vec![("300", "9200"), ("700", "9225")])]
+fn test_l1_trade_tick_updates_book_only_with_trade_execution(
+    #[case] trade_execution: bool,
+    #[case] ask_size: &str,
+    #[case] expected: Vec<(&str, &str)>,
+) {
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "10000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            trade_execution,
+            ..Default::default()
+        },
+        FeeModelHandle::default(),
+        FillModelHandle::new(ProtectionStepFillModel {
+            slip: Rc::new(Cell::new(false)),
+            fail_step: None,
+        }),
+        AccountType::Cash,
+        false,
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument.id(),
+        Price::from("9175"),
+        Price::from("9200"),
+        Quantity::from("1000000"),
+        Quantity::from(ask_size),
+        UnixNanos::from(1u64),
+        UnixNanos::from(1u64),
+    ));
+    engine.process_trade_tick(&TradeTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Quantity::from("100"),
+        AggressorSide::Buy,
+        TradeId::new("1"),
+        UnixNanos::from(2u64),
+        UnixNanos::from(2u64),
+    ));
+
+    let book = engine.get_book();
+    assert_eq!(book.best_ask_price(), Some(Price::from("9200")));
+    if trade_execution {
+        assert_eq!(book.best_ask_size(), Some(Quantity::from("100")));
+        assert_eq!(book.best_bid_price(), Some(Price::from("9200")));
+    } else {
+        assert_eq!(book.best_ask_size(), Some(Quantity::from(ask_size)));
+        assert_eq!(book.best_bid_price(), Some(Price::from("9175")));
+    }
+
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1000"))
+        .client_order_id(ClientOrderId::from("L1-TRADE-BOOK-SOURCE"))
+        .build();
+    submit_cash_test_order(&mut order, account_id);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+
+    let fills = events
+        .get_messages()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.last_qty, fill.last_px)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fills,
+        expected
+            .iter()
+            .map(|(quantity, price)| (Quantity::from(*quantity), Price::from(*price)))
+            .collect::<Vec<_>>()
+    );
+    let cached = cache
+        .borrow()
+        .order(&order.client_order_id())
+        .unwrap()
+        .clone();
+    assert_eq!(cached.status(), OrderStatus::Filled);
+    assert_eq!(cached.filled_qty(), Quantity::from("1000"));
+}
+
+// Declines the first at-the-touch limit fill, then accepts every later one
+struct SecondTouchFillModel {
+    calls: Rc<Cell<usize>>,
+}
+
+impl FillModel for SecondTouchFillModel {
+    fn is_limit_filled(&mut self) -> anyhow::Result<bool> {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        Ok(call > 0)
+    }
+
+    fn is_slipped(&mut self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn get_orderbook_for_fill_simulation(
+        &mut self,
+        _instrument: &InstrumentAny,
+        _order: &OrderAny,
+        _best_bid: Price,
+        _best_ask: Price,
+    ) -> anyhow::Result<Option<OrderBook>> {
+        Ok(None)
+    }
+}
+
+#[rstest]
+fn test_l1_stale_trade_tick_without_trade_execution_does_not_match() {
+    let calls = Rc::new(Cell::new(0));
+    let CashMarketTestContext {
+        mut engine,
+        instrument,
+        cache,
+        events,
+        account_id,
+    } = cash_market_test_context(
+        "10000000 IDR",
+        true,
+        OrderMatchingEngineConfig {
+            trade_execution: false,
+            ..Default::default()
+        },
+        FeeModelHandle::default(),
+        FillModelHandle::new(SecondTouchFillModel {
+            calls: calls.clone(),
+        }),
+        AccountType::Cash,
+        false,
+    );
+    let quote = |bid: &str, ask: &str, ts: u64| {
+        QuoteTick::new(
+            instrument.id(),
+            Price::from(bid),
+            Price::from(ask),
+            Quantity::from("1000"),
+            Quantity::from("1000"),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+    engine.process_quote_tick(&quote("9175", "9225", 1));
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("9200"))
+        .quantity(Quantity::from("100"))
+        .client_order_id(ClientOrderId::from("L1-STALE-TRADE-LIMIT"))
+        .build();
+    submit_cash_test_order(&mut order, account_id);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process_order(&mut order, account_id);
+    engine.process_quote_tick(&quote("9200", "9200", 3));
+    assert_eq!(
+        calls.get(),
+        1,
+        "quote must reach the at-the-touch fill model"
+    );
+
+    engine.process_trade_tick(&TradeTick::new(
+        instrument.id(),
+        Price::from("9200"),
+        Quantity::from("100"),
+        AggressorSide::Sell,
+        TradeId::new("1"),
+        UnixNanos::from(2u64),
+        UnixNanos::from(4u64),
+    ));
+
+    let filled = |events: &TypedIntoMessageSavingHandler<OrderEventAny>| {
+        events
+            .get_messages()
+            .into_iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(fill) => Some((fill.last_qty, fill.last_px)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(filled(&events).is_empty(), "stale trade drove matching");
+    assert_eq!(calls.get(), 1, "stale trade ran a matching pass");
+    assert_eq!(
+        engine.get_book().best_ask_size(),
+        Some(Quantity::from("1000"))
+    );
+
+    engine.process_quote_tick(&quote("9200", "9200", 5));
+    assert_eq!(
+        filled(&events),
+        vec![(Quantity::from("100"), Price::from("9200"))]
+    );
+}
+
 #[derive(Clone, Copy)]
 enum CashTestFeeBehavior {
     Count,
